@@ -1,0 +1,36 @@
+# One conditional card for the Lounge Remote stack: artwork + track details above the
+# live camera feed, shown only while the turntable activity is on.
+# Paste it where the two old conditionals were (the webrtc-camera card and the
+# type: entity card pointing at sensor.vinyl_ear_turntable_now_playing).
+type: conditional
+conditions:
+  - condition: state
+    entity: input_boolean.activity_turntable
+    state: "on"
+card:
+  type: vertical-stack
+  cards:
+    - type: markdown
+      content: >-
+        {%- set s = 'sensor.vinyl_ear_turntable_now_playing' -%}
+        {%- set art = state_attr(s, 'artwork') -%}
+        {%- set artist = state_attr(s, 'artist') -%}
+        {%- set title = state_attr(s, 'title') -%}
+        {%- set album = state_attr(s, 'album') -%}
+        {%- set year = state_attr(s, 'year') -%}
+        {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
+        <div style="opacity:0.6">Vinyl Ear is offline — is the add-on running?</div>
+        {%- elif artist and title -%}
+        <div style="display:flex;align-items:center;gap:16px">
+        {%- if art -%}<img src="{{ art }}" width="76" height="76" style="display:block;border-radius:10px;flex:0 0 auto">{%- endif -%}
+        <div style="min-width:0">
+        <div style="font-size:1.05rem;font-weight:600;line-height:1.25">{{ artist }} — {{ title }}</div>
+        {%- if album -%}
+        <div style="font-size:0.9rem;opacity:0.7;margin-top:4px">{{ album }}{% if year %} · {{ year }}{% endif %}</div>
+        {%- endif -%}
+        </div></div>
+        {%- else -%}
+        <div style="opacity:0.6">Nothing playing — drop the needle.</div>
+        {%- endif -%}
+    - type: custom:webrtc-camera
+      url: Turntable

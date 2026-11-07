@@ -128,6 +128,13 @@ Ready-made views live in [`lovelace/`](lovelace/):
 | `turntable-stack-view.yaml` | Safe fallback — metadata card above the stream, no `card_mod` |
 | `turntable-picture-elements-view.yaml` | Overlay via core `picture-elements` (needs a transparent backdrop image) |
 | `turntable-sections-view.yaml` | Sections view with the metadata in the view header |
+| `turntable-remote-stack.yaml` | One conditional card for a remote-control stack: artwork + details above the camera, shown only while the turntable activity is on |
+
+If you edit the overlay card's CSS, note the line break escape is `\00000A`, not `\A`. A
+short hex escape swallows the next character when it is a hex digit — `\AB` becomes
+U+0ABE and eats the `B`, which displays as `Laufey*lst Friend` instead of
+`Laufey` / `Best Friend`, and `\Ad` becomes a soft hyphen, so `sombr` and `dime` run
+together as `sombrime`.
 
 The full YAML is in
 [`lovelace/turntable-overlay-card.yaml`](lovelace/turntable-overlay-card.yaml):
