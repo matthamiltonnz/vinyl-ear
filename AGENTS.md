@@ -7,7 +7,7 @@ decoding; no framework, no tests directory.
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.6.2**.
+what the startup banner prints). Current: **0.6.3**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -97,12 +97,20 @@ Relevant cards on that installation:
    cover, so the browser must refetch) and keeps the fixed path only as the fallback for when
    the attribute is absent. The pill's text template updates normally on each state change,
    so the style *is* re-rendered; it was the cache, not the renderer, that hid the cover.
-6. **A fixed noise gate is useless in a quiet-ish but not silent room.** At -45 dBFS in a
-   -35 dBFS room every chunk counted as audio: the state never cleared and Shazam was
-   called every 30 s on noise. `calibrate_threshold()` takes the tenth percentile of the
-   last 30 s and sets the threshold 6 dB above it, with `noise_gate_db` as a floor, and
-   only recalibrates while the room looks quiet or when the level is steady and lookups
-   keep failing.
+6. **A fixed noise gate is useless in a quiet-ish but not silent room, and a clever one
+   can silence the listener.** At -45 dBFS in a -35 dBFS room every chunk counted as
+   audio: the state never cleared and Shazam was called every 30 s on noise. But taking
+   the tenth percentile of the last 30 s as a "noise floor" is wrong while a record plays
+   — that percentile is the quiet part of the *music*, so the gate climbed to -28 dBFS,
+   above the record's own dips, and because one chunk below the gate emptied the clip no
+   lookup ever completed again (symptom: heartbeats and nothing else for ten minutes).
+   Now `room_floor()` accepts a window only when its p10 and p90 are within
+   `NOISE_SPREAD_DB` (6 dB) — noise is steady, music is not — and
+   `calibrate_threshold()` only re-learns while nothing has been recognised for
+   `FLOOR_LEARN_AFTER_SECONDS` (5 min); a clip also survives `GATE_HOLD_SECONDS` (1 s)
+   below the gate, so a dip in the music cannot throw it away. The heartbeat prints floor,
+   gate and the share of the last 30 s above the gate, which is what made this
+   diagnosable.
 7. **The supervisor's Home Assistant API needs `homeassistant_api: true`.** Without it the
    `active_entity` poll returns 401; the code raises `GateUnavailable`, logs **once** and
    disables the gate instead of warning every 5 s.

@@ -134,21 +134,27 @@ sampled four times a second rather than in bursts:
 - **Silence clears the state** after `silence_clear_seconds` — see
   [What it publishes](#what-it-publishes).
 - **`active_entity`**, when set, pauses all of the above unless that entity is `on`.
-- **The activity threshold adapts to the room.** `noise_gate_db` is only a floor: the
-  listener measures the quiet tenth percentile of the last 30 seconds and raises the
-  threshold to 6 dB above it, so a fridge, fan or amplifier hiss that sits above the
-  fixed gate stops looking like a record that never ends. It only recalibrates while
-  the room is quiet, or when the audio is steady and Shazam has already failed to name
-  it, so music isn't mistaken for noise. The log says `Room noise floor ~-35 dBFS,
-  activity threshold now -29 dBFS` when it moves.
+- **The activity threshold adapts to the room, without eating the music.**
+  `noise_gate_db` is only a floor: the listener learns the room's own noise level and sits
+  6 dB above it, so a fridge, fan or amplifier hiss that is above the fixed gate stops
+  looking like a record that never ends. Noise is *steady* and music is not, so a window
+  only counts as noise when its tenth and ninetieth percentiles are within 6 dB of each
+  other, and the floor is only re-learned while nothing has been recognised for five
+  minutes. That is what keeps the gate out of the music: the tenth percentile of a
+  music-heavy half minute is the quiet part of the music, and treating it as a floor is
+  how the listener ends up hearing nothing at all. The log says `Room noise floor ~-30 dBFS
+  (steady), activity threshold now -24 dBFS` when it moves.
+- **A dip in the music is not the end of the track.** A clip survives up to a second below
+  the gate before it is discarded, so the quiet bar of a track — or a chunk landing just
+  under a slightly-too-high gate — cannot stop a lookup from ever happening.
 - **Repeated misses back off.** After failed lookups the interval doubles, capping at
   five minutes, so an unrecognisable record doesn't burn a lookup every 30 seconds. A
   fresh silence → sound transition resets it.
-- **Every five minutes** the log reports the level, the current threshold, whether it
-  thinks audio is playing, how many attempts have failed, which track it is holding and
-  how long ago it last asked Shazam — the numbers you need to tune `noise_gate_db` if the
-  room is unusually noisy, and the quickest way to tell a silent room from a stuck
-  listener.
+- **Every five minutes** the log reports the level, the current threshold, what share of
+  the last half minute was above it, whether it thinks audio is playing, how many attempts
+  have failed, which track it is holding and how long ago it last asked Shazam — the
+  numbers you need to tune `noise_gate_db` if the room is unusually noisy, and the quickest
+  way to tell a silent room from a stuck listener.
 
 | Option | Default | Meaning |
 | --- | --- | --- |

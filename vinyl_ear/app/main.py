@@ -18,7 +18,6 @@ import math
 import os
 import shutil
 import signal
-import statistics
 import subprocess
 import tempfile
 import threading
@@ -34,7 +33,7 @@ from shazamio import Shazam
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.6.2"
+VERSION = "0.6.3"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -42,6 +41,14 @@ PREBUFFER_SECONDS = 1.5
 SILENCE_DEBOUNCE_SECONDS = 2.0
 ACTIVE_CHECK_SECONDS = 5.0
 SILENCE_MARGIN_DB = 6.0
+# A chunk below the gate in the middle of the music is a dip, not the end of the
+# track: the clip survives until the room has been quiet for this long.
+GATE_HOLD_SECONDS = 1.0
+# Noise barely moves over half a minute; music swings with every bar. Only a window
+# this flat is accepted as the noise floor.
+NOISE_SPREAD_DB = 6.0
+# Stop learning the floor while a record is still being recognised.
+FLOOR_LEARN_AFTER_SECONDS = 300.0
 CALIBRATION_SECONDS = 1.0
 LEVELS_WINDOW = int(30 / CHUNK_SECONDS)
 # Shazam answers the same audio with different catalogue entries, so a track change
@@ -120,29 +127,45 @@ def rms_to_dbfs(rms: float) -> float:
     return 20.0 * math.log10(max(rms, 1e-9) / FULL_SCALE)
 
 
-def quiet_percentile(levels: "collections.deque[float]") -> float:
-    """Tenth percentile of the recent levels: what the room sounds like when it is quiet."""
-    ordered = sorted(levels)
-    return ordered[len(ordered) // 10] if ordered else -120.0
+def room_floor(levels: "collections.deque[float]") -> float | None:
+    """The quiet level of the room, or None when the window is not quiet.
+
+    Noise is steady: a fan, a fridge or amplifier hiss barely moves across half a
+    minute, so its tenth and ninetieth percentiles sit close together. Music swings
+    with every bar, so the tenth percentile of a music-heavy window is simply the
+    quiet part of the music - taking that for a noise floor is how the gate climbed
+    into the music and stopped the listener calling Shazam at all.
+    """
+    window = sorted(levels)
+    if len(window) < LEVELS_WINDOW // 3:
+        return None
+    low = window[len(window) // 10]
+    high = window[len(window) * 9 // 10]
+    if high - low > NOISE_SPREAD_DB:
+        return None
+    return low
 
 
 def calibrate_threshold(
-    levels: "collections.deque[float]", cfg: Config, playing: bool, failures: int
-) -> float | None:
-    """Derive an activity threshold from the room, or None to keep the current one.
+    levels: "collections.deque[float]", cfg: Config, since_match: float | None
+) -> tuple[float, float] | None:
+    """Return (floor, threshold), or None to keep the current threshold.
 
     A fixed gate is useless in a room whose fan or amplifier sits above it: the
-    listener then sees "audio" forever, never identifies anything, and never clears.
-    Learn the quiet level instead, but only trust it while the room is quiet, or when
-    the audio is steady and Shazam has already failed to name it a couple of times.
+    listener then sees 'audio' forever, never identifies anything and never settles.
+    Learn the room instead - but only from steady audio, and only while nothing has
+    been recognised for a while: a record that is being named is not a noise floor.
     """
-    if len(levels) < 40:  # about ten seconds
+    if since_match is not None and since_match < FLOOR_LEARN_AFTER_SECONDS:
         return None
-    steady = statistics.pstdev(levels) < 3.0
-    if playing and (failures == 0 or not steady):
+    floor = room_floor(levels)
+    if floor is None:
         return None
-    wanted = quiet_percentile(levels) + SILENCE_MARGIN_DB
-    return min(max(wanted, cfg.noise_gate_db), cfg.noise_gate_db + 25.0)
+    wanted = min(
+        max(floor + SILENCE_MARGIN_DB, cfg.noise_gate_db),
+        cfg.noise_gate_db + 25.0,
+    )
+    return floor, wanted
 
 
 def find_source(cfg: Config) -> str:
@@ -575,6 +598,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     last_attempt_at = 0.0
     current_key: tuple[str, str] | None = None
     last_track: dict[str, Any] | None = None
+    last_identified_at: float | None = None
     state_is_unidentified = False
     playing = False
     new_segment = True
@@ -590,8 +614,9 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
     async def commit(key: tuple[str, str], track: dict[str, Any]) -> None:
         """Publish a track the listener is confident about."""
-        nonlocal current_key, last_track, state_is_unidentified
+        nonlocal current_key, last_track, state_is_unidentified, last_identified_at
         current_key = key
+        last_identified_at = now
         state_is_unidentified = False
         if apply_album_preference(track, albums, cfg.keep_first_album):
             log.info("Song already known, keeping the first album: %s", track["album"])
@@ -634,14 +659,20 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
             if now - last_calibration >= CALIBRATION_SECONDS:
                 last_calibration = now
-                calibrated = calibrate_threshold(levels, cfg, playing, failures)
-                if calibrated is not None and abs(calibrated - threshold) >= 1.0:
-                    threshold = calibrated
-                    log.info(
-                        "Room noise floor ~%.0f dBFS, activity threshold now %.0f dBFS",
-                        quiet_percentile(levels),
-                        threshold,
-                    )
+                since_match = (
+                    None if last_identified_at is None else now - last_identified_at
+                )
+                calibrated = calibrate_threshold(levels, cfg, since_match)
+                if calibrated is not None:
+                    floor, wanted = calibrated
+                    if abs(wanted - threshold) >= 1.0:
+                        threshold = wanted
+                        log.info(
+                            "Room noise floor ~%.0f dBFS (steady), "
+                            "activity threshold now %.0f dBFS",
+                            floor,
+                            threshold,
+                        )
 
             gap = last_loud_at is None or (now - last_loud_at) >= GAP_SECONDS
 
@@ -664,10 +695,15 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             else:
                 if last_loud_at is None:
                     last_loud_at = now - SILENCE_DEBOUNCE_SECONDS
-                if playing and (now - last_loud_at) >= SILENCE_DEBOUNCE_SECONDS:
+                quiet_for = now - last_loud_at
+                if playing and quiet_for >= SILENCE_DEBOUNCE_SECONDS:
                     playing = False
                     publish(client, playing_topic, "OFF")
-                clip = bytearray()
+                if quiet_for >= GATE_HOLD_SECONDS:
+                    # A real gap, not the quiet bar of the track that is playing.
+                    clip = bytearray()
+                elif len(clip) < listen_bytes * 3:
+                    clip.extend(data)
 
             prebuffer.extend(data)
             if len(prebuffer) > prebuffer_bytes:
@@ -676,10 +712,12 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if now - last_heartbeat >= HEARTBEAT_SECONDS:
                 last_heartbeat = now
                 log.info(
-                    "Room level %.0f dBFS (threshold %.0f), playing=%s, failures=%d, "
-                    "holding=%s, last lookup %ds ago",
+                    "Room level %.0f dBFS (threshold %.0f, %d%% of the last 30s above), "
+                    "playing=%s, failures=%d, holding=%s, last lookup %ds ago",
                     level,
                     threshold,
+                    100 * sum(1 for value in levels if value >= threshold)
+                    // max(len(levels), 1),
                     playing,
                     failures,
                     (last_track or {}).get("display") or "nothing",
