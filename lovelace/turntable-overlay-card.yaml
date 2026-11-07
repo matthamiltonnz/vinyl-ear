@@ -26,6 +26,20 @@ cards:
         {%- else -%}
         {%- set lines = 'Nothing playing — drop the needle' -%}
         {%- endif -%}
+        {%- if art %}
+        ha-card::before {
+          content: url('{{ art }}');
+          position: absolute;
+          top: calc(3.5% + 18px);
+          left: calc(2.5% + 22px);
+          width: 88px;
+          height: 88px;
+          object-fit: cover;
+          border-radius: 12px;
+          z-index: 4;
+          pointer-events: none;
+        }
+        {%- endif %}
         ha-card::after {
           content: "{{ lines }}";
           position: absolute;

@@ -97,6 +97,11 @@ Relevant cards on that installation:
    cover, so the browser must refetch) and keeps the fixed path only as the fallback for when
    the attribute is absent. The pill's text template updates normally on each state change,
    so the style *is* re-rendered; it was the cache, not the renderer, that hid the cover.
+   That still left the cover unpainted on the cast while the *same* URL loaded fine in the
+   markdown `<img>` beside the camera, so the pill also paints it with
+   `ha-card::before { content: url('{{ art }}') }` — real replaced content rather than a
+   background. If it ever goes missing again, compare the two: markdown `<img>` working and
+   `::before` not means the trouble is painting, both failing means the URL or the file.
 6. **A fixed noise gate is useless in a quiet-ish but not silent room, and a clever one
    can silence the listener.** At -45 dBFS in a -35 dBFS room every chunk counted as
    audio: the state never cleared and Shazam was called every 30 s on noise. But taking
