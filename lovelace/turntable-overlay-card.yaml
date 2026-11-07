@@ -1,0 +1,48 @@
+type: panel
+title: Turntable
+path: turntable
+cards:
+  - type: custom:webrtc-camera
+    url: Turntable
+    card_mod:
+      style: |
+        {%- set s = 'sensor.vinyl_ear_turntable_now_playing' -%}
+        {%- set art = state_attr(s, 'artwork') -%}
+        {%- set artist = state_attr(s, 'artist') -%}
+        {%- set title = state_attr(s, 'title') -%}
+        {%- set album = state_attr(s, 'album') -%}
+        {%- set year = state_attr(s, 'year') -%}
+        {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
+        {%- set lines = 'Vinyl Ear is offline — is the add-on running?' -%}
+        {%- elif artist and title -%}
+        {%- set lines = artist ~ '\A' ~ title ~ ('\A' ~ album ~ (' · ' ~ year if year else '') if album else '') -%}
+        {%- else -%}
+        {%- set lines = 'Nothing playing — drop the needle' -%}
+        {%- endif -%}
+        ha-card::after {
+          content: "{{ lines }}";
+          position: absolute;
+          top: 3.5%;
+          left: 2.5%;
+          max-width: 62%;
+          padding: 18px 26px;
+          border-radius: 20px;
+          background-color: rgba(8, 10, 16, 0.66);
+          {% if art -%}
+          background-image: url('{{ art }}');
+          background-position: 22px center;
+          background-size: 88px 88px;
+          background-repeat: no-repeat;
+          padding-left: 132px;
+          min-height: 88px;
+          {% endif -%}
+          color: #ffffff;
+          font-size: 1.45rem;
+          font-weight: 600;
+          line-height: 1.42;
+          white-space: pre-line;
+          box-shadow: 0 14px 36px rgba(0, 0, 0, 0.45);
+          text-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+          z-index: 3;
+          pointer-events: none;
+        }

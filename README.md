@@ -1,0 +1,131 @@
+# Vinyl Ear
+
+Home Assistant add-on that works out **what record is playing** on the turntable and
+publishes it to Home Assistant over MQTT. Vinyl is analogue, so nothing reports track
+metadata — this listens to a room microphone, fingerprints the audio with Shazam, and
+fills in the gap.
+
+```
+room mic ──▶ noise gate ──▶ 15 s clip ──▶ Shazam (shazamio) ──▶ MQTT discovery
+                                                                 ├─ sensor.turntable_now_playing
+                                                                 └─ binary_sensor.turntable_audio
+```
+
+## Why not an existing project?
+
+Two exist, both tiny and neither works unmodified on Home Assistant OS:
+
+- **[shazam2mqtt](https://github.com/TigreGotico/shazam2mqtt)** — closest match
+  (noise gate, capture, Shazam, MQTT discovery with ten entities). Its Docker image
+  drives the mic through PortAudio's **ALSA** backend, and inside a container on HAOS
+  ALSA cannot see the USB capture devices: they are held by the host PulseAudio, and
+  `/proc/asound` is not visible. Enumerated devices were `[]` (or HDMI outputs only).
+- **[ha_shazamio](https://github.com/iamjoshk/ha_shazamio)** — a HACS integration that
+  exposes ShazamIO as services/events. It does not capture audio at all; you have to
+  feed it a file. It describes itself as "VERY ALPHA".
+
+Vinyl Ear keeps the behaviour everyone wants from shazam2mqtt (noise-gated capture,
+cooldowns, MQTT discovery) but records through the **PulseAudio socket** that Home
+Assistant hands to add-ons with `audio: true` — the same path that `parec` and
+`ffmpeg -f pulse` use, which is what actually works on this box.
+
+## What it publishes
+
+| Entity | State | Attributes |
+| --- | --- | --- |
+| `sensor.vinyl_ear_turntable_now_playing` | `Artist - Title` | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `url`, `source`, `identified_at` |
+| `binary_sensor.vinyl_ear_turntable_audio_detected` | `ON` while the room is above the noise gate | — |
+
+Entity ids follow the HA device name, so they carry the `vinyl_ear_` prefix; rename them
+in the UI if you want `sensor.turntable_now_playing`. Everything appears under one HA
+device named `Vinyl Ear (turntable)`, created by MQTT discovery — no YAML required.
+
+Album artwork is downloaded to `/config/www/vinyl-art/<device_name>.jpg` and the
+`artwork` attribute points at `/local/vinyl-art/<device_name>.jpg?v=<epoch>` so every
+client (including Cast displays and other networks) loads the cover from Home Assistant
+instead of Apple's CDN, whose URLs expire. The untouched CDN URL is kept in
+`artwork_remote`. This needs the add-on's read-write access to `/config` (`map: config:rw`),
+which is already declared; if the folder is not writable the remote URL is published as
+before.
+
+## Options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `source` | *(auto)* | PulseAudio source name. Empty picks the first non-monitor input. |
+| `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
+| `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
+| `capture_timeout` | `120` | Give up and count it as silence after this many seconds without a clip. |
+| `noise_gate_db` | `-45` | dBFS considered "not silence". Room noise sits near -60; music is well above. |
+| `poll_seconds` | `30` | Pause between recognition attempts. |
+| `device_name` | `turntable` | Node name for topics and entity IDs. |
+| `mqtt_host` | `core-mosquitto` | Broker. Use `<ha-host>` if you prefer the LAN address. |
+| `mqtt_port` | `1883` | Broker port. |
+| `mqtt_user` / `mqtt_password` | *(empty)* | Leave empty for anonymous brokers. |
+| `discovery_prefix` | `homeassistant` | HA's MQTT discovery prefix. |
+| `log_level` | `info` | `debug` logs every capture attempt and the audio level. |
+
+## Before you trust the audio
+
+The webcam microphone must actually be listening. On this installation the USB webcam mic source was sitting at **12% (-55 dB)** in PulseAudio, i.e. effectively muted,
+and no amount of fingerprinting will fix that:
+
+```bash
+pactl set-source-volume <usb-mic-source> 45%
+```
+
+45% measured -24.7 dB mean / -8.1 dB peak on a record and matched within seconds; 70%
+clipped. Nothing else uses that mic (the go2rtc "Turntable" stream is video-only), so
+the gain can stay where you put it.
+
+## Install
+
+### From this repository (recommended)
+
+In Home Assistant: **Settings → Add-ons → Add-on store → ⋮ → Repositories**, add
+
+```
+https://github.com/matthamiltonnz/vinyl-ear
+```
+
+then close the dialog, refresh the store and install **Vinyl Ear**. Before pressing
+Start, open the **Configuration** tab and set `mqtt_user` / `mqtt_password`.
+
+### As a local add-on
+
+Copy the `vinyl_ear` folder to the Home Assistant host and reload the store:
+
+```bash
+scp -r vinyl_ear <ssh-user>@<home-assistant-host>:/addons/vinyl_ear
+```
+
+Then **Settings → Add-ons → Add-on store → ⋮ → Reload**, pick *Vinyl Ear*, install,
+paste your MQTT username/password in the configuration tab, and start it.
+
+## Lovelace card
+
+Ready-made views live in [`lovelace/`](lovelace/):
+
+| File | Layout |
+| --- | --- |
+| `turntable-overlay-card.yaml` | **Recommended** — single `custom:webrtc-camera` card, metadata pill painted over the video with `card_mod` (full-screen panel view) |
+| `turntable-stack-view.yaml` | Safe fallback — metadata card above the stream, no `card_mod` |
+| `turntable-picture-elements-view.yaml` | Overlay via core `picture-elements` (needs a transparent backdrop image) |
+| `turntable-sections-view.yaml` | Sections view with the metadata in the view header |
+
+The full YAML is in
+[`lovelace/turntable-overlay-card.yaml`](lovelace/turntable-overlay-card.yaml):
+a `panel` view holding a single `custom:webrtc-camera` card, with a `card_mod`
+style that paints the cover, artist, title and album over the stream.
+
+## Notes and limits
+
+- Shazam identification is via the reverse-engineered API (`shazamio`), the same way
+  shazam2mqtt and ha_shazamio do it. It is free and needs no key, but it is unofficial:
+  if it ever breaks, swap the client for ACRCloud or AudD behind the same interface.
+- Expect ~15-25 s from needle drop to a published track: 15 s of audio plus the lookup.
+- Quiet passages, spoken intros and private pressings may not match. The last known
+  track stays published until something new is recognised, so the dashboard never
+  blanks mid-side.
+- Recognition requests only happen while the room is above the noise gate, at most
+  once every `poll_seconds`.

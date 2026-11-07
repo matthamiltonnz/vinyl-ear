@@ -1,0 +1,31 @@
+type: panel
+title: Turntable
+path: turntable
+cards:
+  - type: vertical-stack
+    cards:
+      - type: markdown
+        content: >-
+          {%- set s = 'sensor.vinyl_ear_turntable_now_playing' -%}
+          {%- set art = state_attr(s, 'artwork') -%}
+          {%- set artist = state_attr(s, 'artist') -%}
+          {%- set title = state_attr(s, 'title') -%}
+          {%- set album = state_attr(s, 'album') -%}
+          {%- set year = state_attr(s, 'year') -%}
+          {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
+          Vinyl Ear is offline — is the add-on running?
+          {%- elif artist and title -%}
+          <div style="display:flex;align-items:center;gap:24px">
+          {%- if art -%}<img src="{{ art }}" width="72" height="72" style="display:block;border-radius:10px;flex:0 0 auto">{%- endif -%}
+          <div style="min-width:0">
+          <div style="font-size:1.6rem;font-weight:700;line-height:1.15">{{ artist }}</div>
+          <div style="font-size:1.2rem;line-height:1.25;opacity:0.85">{{ title }}</div>
+          {%- if album -%}
+          <div style="font-size:0.95rem;opacity:0.6;margin-top:4px">{{ album }}{% if year %} · {{ year }}{% endif %}</div>
+          {%- endif -%}
+          </div></div>
+          {%- else -%}
+          Nothing playing — drop the needle.
+          {%- endif -%}
+      - type: custom:webrtc-camera
+        url: Turntable

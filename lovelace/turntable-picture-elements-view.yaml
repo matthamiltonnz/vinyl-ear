@@ -1,0 +1,50 @@
+type: panel
+title: Turntable
+path: turntable
+cards:
+  - type: picture-elements
+    image: /local/vinyl-ear/overlay-backdrop.png
+    elements:
+      - type: custom:webrtc-camera
+        url: Turntable
+        style:
+          top: 0
+          left: 0
+          width: 100%
+          height: 100%
+      - type: markdown
+        style:
+          top: 4%
+          left: 4%
+          max-width: 78%
+        card_mod:
+          style: |
+            ha-card {
+              background: transparent;
+              box-shadow: none;
+              border: none;
+              padding: 0;
+              overflow: visible;
+            }
+        content: >-
+          {%- set s = 'sensor.vinyl_ear_turntable_now_playing' -%}
+          {%- set art = state_attr(s, 'artwork') -%}
+          {%- set artist = state_attr(s, 'artist') -%}
+          {%- set title = state_attr(s, 'title') -%}
+          {%- set album = state_attr(s, 'album') -%}
+          {%- set year = state_attr(s, 'year') -%}
+          {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
+          <div style="display:inline-block;padding:14px 26px;border-radius:999px;background:rgba(8,10,16,0.66);color:rgba(255,255,255,0.72);font-size:1.05rem">Vinyl Ear is offline — is the add-on running?</div>
+          {%- elif artist and title -%}
+          <div style="display:flex;align-items:center;gap:30px;padding:22px 34px;border-radius:26px;background:rgba(8,10,16,0.62);box-shadow:0 12px 44px rgba(0,0,0,0.5)">
+          {%- if art -%}<img src="{{ art }}" width="132" height="132" style="display:block;border-radius:16px;flex:0 0 auto">{%- endif -%}
+          <div style="min-width:0">
+          <div style="font-size:2.1rem;font-weight:700;line-height:1.12;color:#fff">{{ artist }}</div>
+          <div style="font-size:1.45rem;line-height:1.25;color:rgba(255,255,255,0.86);margin-top:8px">{{ title }}</div>
+          {%- if album -%}
+          <div style="font-size:1.05rem;letter-spacing:0.02em;color:rgba(255,255,255,0.58);margin-top:12px">{{ album }}{% if year %} · {{ year }}{% endif %}</div>
+          {%- endif -%}
+          </div></div>
+          {%- else -%}
+          <div style="display:inline-block;padding:14px 26px;border-radius:999px;background:rgba(8,10,16,0.66);color:rgba(255,255,255,0.72);font-size:1.05rem">Nothing playing — drop the needle.</div>
+          {%- endif -%}

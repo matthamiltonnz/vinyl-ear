@@ -1,0 +1,3 @@
+aiohttp>=3.9,<4
+shazamio==0.9.0
+paho-mqtt>=2.1,<3

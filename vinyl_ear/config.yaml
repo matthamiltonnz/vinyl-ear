@@ -1,0 +1,42 @@
+name: Vinyl Ear
+version: "0.1.0"
+slug: vinyl_ear
+description: Listens to a room microphone, identifies the record that is playing with Shazam, and publishes it to Home Assistant over MQTT
+url: https://github.com/matthamiltonnz/vinyl-ear
+arch:
+  - amd64
+  - aarch64
+audio: true
+map:
+  - config:rw
+startup: application
+boot: auto
+init: false
+options:
+  source: ""
+  sample_rate: 44100
+  listen_seconds: 15
+  capture_timeout: 120
+  noise_gate_db: -45
+  poll_seconds: 30
+  device_name: turntable
+  mqtt_host: core-mosquitto
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  discovery_prefix: homeassistant
+  log_level: info
+schema:
+  source: str?
+  sample_rate: list(16000|44100|48000)
+  listen_seconds: int(5,30)
+  capture_timeout: int(30,600)
+  noise_gate_db: float
+  poll_seconds: int(5,600)
+  device_name: match(^[a-z0-9_]+$)
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_user: str?
+  mqtt_password: password?
+  discovery_prefix: str
+  log_level: list(debug|info|warning|error)
