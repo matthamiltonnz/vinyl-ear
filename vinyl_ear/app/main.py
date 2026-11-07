@@ -33,7 +33,10 @@ OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
-SILENCE_RESET_SECONDS = 1.5
+GAP_SECONDS = 2.0
+PREBUFFER_SECONDS = 1.5
+SILENCE_DEBOUNCE_SECONDS = 2.0
+ACTIVE_CHECK_SECONDS = 5.0
 
 log = logging.getLogger("vinyl_ear")
 stop = threading.Event()
@@ -46,6 +49,7 @@ class CaptureError(RuntimeError):
 @dataclasses.dataclass(frozen=True)
 class Config:
     source: str
+    active_entity: str
     sample_rate: int
     listen_seconds: int
     capture_timeout: int
@@ -74,6 +78,7 @@ def load_config() -> Config:
         raw = json.loads(OPTIONS_FILE.read_text())
     return Config(
         source=str(raw.get("source") or "").strip(),
+        active_entity=str(raw.get("active_entity") or "").strip(),
         sample_rate=int(raw.get("sample_rate", 44100)),
         listen_seconds=int(raw.get("listen_seconds", 15)),
         capture_timeout=int(raw.get("capture_timeout", 60)),
@@ -133,11 +138,18 @@ def parec_command(cfg: Config, source: str) -> list[str]:
     ]
 
 
-def capture_clip(cfg: Config, source: str) -> bytes | None:
-    """Record until `listen_seconds` of audio above the noise gate is collected.
+def chunk_level(data: bytes) -> float:
+    """dBFS of one s16le chunk."""
+    samples = array.array("h")
+    samples.frombytes(data)
+    if not samples:
+        return -120.0
+    rms = math.sqrt(sum(s * s for s in samples) / len(samples))
+    return rms_to_dbfs(rms)
 
-    Returns None when nothing but silence was heard within `capture_timeout`.
-    """
+
+async def audio_reader(cfg: Config, source: str, queue: "asyncio.Queue[bytes]") -> None:
+    """Stream capture chunks into the queue for as long as the add-on runs."""
     command = parec_command(cfg, source)
     log.debug("Starting capture: %s", " ".join(command))
     proc = subprocess.Popen(
@@ -148,19 +160,9 @@ def capture_clip(cfg: Config, source: str) -> bytes | None:
     )
     assert proc.stdout is not None
     chunk_bytes = int(cfg.sample_rate * 2 * CHUNK_SECONDS)
-    target_bytes = int(cfg.bytes_per_second * cfg.listen_seconds)
-    clip = bytearray()
-    silence = 0.0
-    deadline = time.monotonic() + cfg.capture_timeout
-
     try:
         while not stop.is_set():
-            if time.monotonic() > deadline:
-                log.debug(
-                    "No audio above %.0f dBFS within %ss", cfg.noise_gate_db, cfg.capture_timeout
-                )
-                return None
-            data = proc.stdout.read(chunk_bytes)
+            data = await asyncio.to_thread(proc.stdout.read, chunk_bytes)
             if not data:
                 stderr = b""
                 if proc.stderr is not None:
@@ -168,26 +170,45 @@ def capture_clip(cfg: Config, source: str) -> bytes | None:
                 raise CaptureError(
                     "capture stream ended: " + stderr.decode("utf-8", "replace").strip()
                 )
-            usable = len(data) - (len(data) % 2)
-            samples = array.array("h")
-            samples.frombytes(data[:usable])
-            rms = math.sqrt(sum(s * s for s in samples) / len(samples)) if samples else 0.0
-            if rms_to_dbfs(rms) >= cfg.noise_gate_db:
-                silence = 0.0
-                clip.extend(data[:usable])
-                if len(clip) >= target_bytes:
-                    return bytes(clip[:target_bytes])
-            else:
-                silence += CHUNK_SECONDS
-                if silence >= SILENCE_RESET_SECONDS:
-                    clip.clear()
+            await queue.put(data[: len(data) - (len(data) % 2)])
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-    return None
+
+
+async def supervised_entity_is_on(session: aiohttp.ClientSession, entity_id: str) -> bool:
+    """Read an entity state through the supervisor's Home Assistant API proxy."""
+    token = os.environ.get("SUPERVISOR_TOKEN", "")
+    if not token:
+        log.warning("No SUPERVISOR_TOKEN, ignoring active_entity")
+        return True
+    url = f"http://supervisor/core/api/states/{entity_id}"
+    async with session.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=aiohttp.ClientTimeout(total=10),
+    ) as response:
+        if response.status != 200:
+            log.warning("Could not read %s (HTTP %s)", entity_id, response.status)
+            return True
+        payload = await response.json()
+    return payload.get("state") == "on"
+
+
+async def watch_active_entity(
+    cfg: Config, session: aiohttp.ClientSession, flag: dict[str, bool]
+) -> None:
+    """Keep flag['active'] in step with the configured entity."""
+    while not stop.is_set():
+        try:
+            flag["active"] = await supervised_entity_is_on(session, cfg.active_entity)
+        except Exception as err:  # noqa: BLE001 - fail open rather than stop listening
+            log.warning("Active entity check failed (%s); assuming active", err)
+            flag["active"] = True
+        await asyncio.sleep(ACTIVE_CHECK_SECONDS)
 
 
 def write_wav(pcm: bytes, sample_rate: int) -> str:
@@ -375,70 +396,117 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
     state_topic = f"{cfg.base_topic}/state"
     playing_topic = f"{cfg.base_topic}/playing"
+    listen_bytes = int(cfg.bytes_per_second * cfg.listen_seconds)
+    prebuffer_bytes = int(cfg.bytes_per_second * PREBUFFER_SECONDS)
+
     shazam = Shazam()
     session = aiohttp.ClientSession()
-    source: str | None = None
+    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=240)
+    active = {"active": True}
+    watcher = (
+        asyncio.create_task(watch_active_entity(cfg, session, active))
+        if cfg.active_entity
+        else None
+    )
+
+    source = await asyncio.to_thread(find_source, cfg)
+    reader = asyncio.create_task(audio_reader(cfg, source, queue))
+
+    prebuffer = bytearray()
+    clip = bytearray()
+    last_loud_at: float | None = None
+    last_attempt_at = 0.0
     current_key: tuple[str, str] | None = None
     playing = False
+    new_segment = True
 
-    while not stop.is_set():
-        if source is None:
-            try:
-                source = await asyncio.to_thread(find_source, cfg)
-            except CaptureError as err:
-                log.error("%s", err)
-                await asyncio.sleep(15)
+    try:
+        while not stop.is_set():
+            data = await queue.get()
+            now = time.monotonic()
+
+            if not active["active"]:
+                if playing:
+                    playing = False
+                    publish(client, playing_topic, "OFF")
+                if current_key is not None:
+                    current_key = None
+                    publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
+                    log.info("%s is off — cleared the now playing state", cfg.active_entity)
+                clip = bytearray()
+                last_loud_at = now
                 continue
 
-        try:
-            clip = await asyncio.to_thread(capture_clip, cfg, source)
-        except CaptureError as err:
-            log.error("%s", err)
-            source = None
-            await asyncio.sleep(10)
-            continue
+            level = chunk_level(data)
+            gap = last_loud_at is None or (now - last_loud_at) >= GAP_SECONDS
 
-        if clip is None:
-            if playing:
-                playing = False
-                publish(client, playing_topic, "OFF")
-            if current_key is not None:
+            if level >= cfg.noise_gate_db:
+                if gap:
+                    clip = bytearray(prebuffer) + data
+                    new_segment = True
+                    log.debug("Audio at %.0f dBFS — starting a clip", level)
+                elif len(clip) < listen_bytes * 3:
+                    clip.extend(data)
+                last_loud_at = now
+                if not playing:
+                    playing = True
+                    publish(client, playing_topic, "ON")
+            else:
+                if last_loud_at is None:
+                    last_loud_at = now - SILENCE_DEBOUNCE_SECONDS
+                if playing and (now - last_loud_at) >= SILENCE_DEBOUNCE_SECONDS:
+                    playing = False
+                    publish(client, playing_topic, "OFF")
+                clip = bytearray()
+
+            prebuffer.extend(data)
+            if len(prebuffer) > prebuffer_bytes:
+                del prebuffer[: len(prebuffer) - prebuffer_bytes]
+
+            if current_key is not None and (now - last_loud_at) >= cfg.capture_timeout:
                 current_key = None
                 publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
                 log.info(
-                    "Silence for %ss — cleared the now playing state", cfg.capture_timeout
+                    "Silent for %ss — cleared the now playing state", cfg.capture_timeout
                 )
-            await asyncio.sleep(1)
-            continue
 
-        if not playing:
-            playing = True
-            publish(client, playing_topic, "ON")
+            cooldown = 0.0 if new_segment else float(cfg.poll_seconds)
+            if len(clip) >= listen_bytes and (now - last_attempt_at) >= cooldown:
+                last_attempt_at = now
+                new_segment = False
+                track = await recognise(shazam, cfg, bytes(clip[:listen_bytes]))
+                clip = bytearray()
+                last_loud_at = time.monotonic()
+                while not queue.empty():
+                    queue.get_nowait()
+                prebuffer = bytearray()
 
-        track = await recognise(shazam, cfg, clip)
-        if track is None:
-            log.info("Heard audio but Shazam did not recognise it")
-        else:
-            key = (track["artist"], track["title"])
-            if key != current_key:
-                current_key = key
-                remote_artwork = track["artwork"]
-                track["artwork"] = await cache_artwork(session, remote_artwork, cfg.device_name)
-                track["artwork_remote"] = remote_artwork
-                publish(client, state_topic, json.dumps(track))
-                log.info(
-                    "Now playing: %s - %s (%s, %s)",
-                    track["artist"] or "?",
-                    track["title"] or "?",
-                    track["album"] or "unknown album",
-                    track["year"] or "unknown year",
-                )
-            else:
-                log.debug("Same track still playing: %s - %s", *key)
-
-        await asyncio.sleep(cfg.poll_seconds)
-
-    await session.close()
+                if track is None:
+                    log.info("Heard audio but Shazam did not recognise it")
+                else:
+                    key = (track["artist"], track["title"])
+                    if key == current_key:
+                        log.debug("Same track still playing: %s - %s", *key)
+                    else:
+                        current_key = key
+                        remote_artwork = track["artwork"]
+                        track["artwork"] = await cache_artwork(
+                            session, remote_artwork, cfg.device_name
+                        )
+                        track["artwork_remote"] = remote_artwork
+                        publish(client, state_topic, json.dumps(track))
+                        log.info(
+                            "Now playing: %s - %s (%s, %s)",
+                            track["artist"] or "?",
+                            track["title"] or "?",
+                            track["album"] or "unknown album",
+                            track["year"] or "unknown year",
+                        )
+    finally:
+        reader.cancel()
+        if watcher is not None:
+            watcher.cancel()
+        await session.close()
 
 
 def handle_signal(signum: int, _frame: Any) -> None:

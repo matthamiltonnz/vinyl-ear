@@ -1,5 +1,5 @@
 name: Vinyl Ear
-version: "0.2.0"
+version: "0.3.0"
 slug: vinyl_ear
 description: Listens to a room microphone, identifies the record that is playing with Shazam, and publishes it to Home Assistant over MQTT
 url: https://github.com/matthamiltonnz/vinyl-ear
@@ -7,6 +7,7 @@ arch:
   - amd64
   - aarch64
 audio: true
+homeassistant_api: true
 map:
   - config:rw
 startup: application
@@ -14,6 +15,7 @@ boot: auto
 init: false
 options:
   source: ""
+  active_entity: ""
   sample_rate: 44100
   listen_seconds: 15
   capture_timeout: 60
@@ -28,6 +30,7 @@ options:
   log_level: info
 schema:
   source: str?
+  active_entity: str?
   sample_rate: list(16000|44100|48000)
   listen_seconds: int(5,30)
   capture_timeout: int(15,600)

@@ -50,14 +50,30 @@ before.
 
 ## Options
 
+The microphone is opened once and read continuously in 250 ms chunks, so the level is
+sampled four times a second rather than in bursts:
+
+- **Silence → sound triggers an immediate lookup.** After at least 2 s of quiet, the
+  next audio above the noise gate starts a fresh clip (with 1.5 s of pre-roll so the
+  first beat isn't cut), and the track is identified as soon as `listen_seconds` has
+  been gathered — no waiting for a poll interval. That covers needle drop, the gap
+  between tracks and a side change.
+- **While music continues**, it re-identifies every `poll_seconds` so a track change
+  without a silent gap is still caught, and a repeat match of the same track is
+  suppressed.
+- **Silence clears the state** after `capture_timeout` seconds — see
+  [What it publishes](#what-it-publishes).
+- **`active_entity`**, when set, pauses all of the above unless that entity is `on`.
+
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `source` | *(auto)* | PulseAudio source name. Empty picks the first non-monitor input. |
+| `active_entity` | *(none)* | Listen only while this entity is `on`, e.g. `input_boolean.activity_turntable`. Empty means always listen. Read through the supervisor's Home Assistant API; if it cannot be read the add-on keeps listening. |
 | `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
 | `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
 | `capture_timeout` | `60` | Seconds of silence before an attempt gives up — this is also how long the room must be quiet before the now-playing state is cleared (lifted needle, side change, record put away). |
 | `noise_gate_db` | `-45` | dBFS considered "not silence". Room noise sits near -60; music is well above. |
-| `poll_seconds` | `30` | Pause between recognition attempts. |
+| `poll_seconds` | `30` | Re-check interval while the music keeps playing. A new sound after a silent gap is recognised immediately, without waiting for this. |
 | `device_name` | `turntable` | Node name for topics and entity IDs. |
 | `mqtt_host` | `core-mosquitto` | Broker. Use `<ha-host>` if you prefer the LAN address. |
 | `mqtt_port` | `1883` | Broker port. |
