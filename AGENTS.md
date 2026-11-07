@@ -7,7 +7,7 @@ decoding; no framework, no tests directory.
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.5.0**.
+what the startup banner prints). Current: **0.6.0**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -156,8 +156,10 @@ the storage files under `/config/.storage` instead.
 
 - Shazam here is reverse engineered (`shazamio`): no key, no quota, but it can break.
   ACRCloud or AudD would slot in behind the same interface.
-- Obscure and private pressings are simply unknown to Shazam; the listener then keeps the
-  last recognised track until `silence_clear_seconds` passes.
+- Obscure and private pressings are simply unknown to Shazam. Rather than holding the last
+  title, the listener keeps the album and blanks the track name (`unidentified_track()`,
+  `unknown_track: true`) because no `silence_clear_seconds` gap has passed — so a side
+  change with less than that much quiet keeps the previous album until the state clears.
 - Album and year come from Shazam's catalogue, not the physical pressing;
   `keep_first_album` keeps the first answer but cannot know the sleeve in your hand.
 - The square camera tile relies on `aspect-ratio` plus `object-fit: cover`; if a client

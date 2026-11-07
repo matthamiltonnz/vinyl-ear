@@ -18,8 +18,8 @@ cards:
         {%- set year = state_attr(s, 'year') -%}
         {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
         {%- set lines = 'Vinyl Ear is offline — is the add-on running?' -%}
-        {%- elif artist and title -%}
-        {%- set lines = artist ~ '\\00000A' ~ title ~ ('\\00000A' ~ album ~ (' · ' ~ year if year else '') if album else '') -%}
+        {%- elif artist or title or album -%}
+        {%- set lines = artist ~ '\\00000A' ~ (title or 'track not identified') ~ ('\\00000A' ~ album ~ (' · ' ~ year if year else '') if album else '') -%}
         {%- else -%}
         {%- set lines = 'Nothing playing — drop the needle' -%}
         {%- endif -%}

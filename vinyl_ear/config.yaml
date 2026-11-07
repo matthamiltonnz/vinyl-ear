@@ -1,5 +1,5 @@
 name: Vinyl Ear
-version: "0.5.0"
+version: "0.6.0"
 slug: vinyl_ear
 description: Listens to a room microphone, identifies the record that is playing with Shazam, and publishes it to Home Assistant over MQTT
 url: https://github.com/matthamiltonnz/vinyl-ear
@@ -20,6 +20,7 @@ options:
   listen_seconds: 15
   silence_clear_seconds: 45
   keep_first_album: true
+  blank_unknown_track: true
   noise_gate_db: -45
   poll_seconds: 30
   device_name: turntable
@@ -36,6 +37,7 @@ schema:
   listen_seconds: int(5,30)
   silence_clear_seconds: int(10,900)
   keep_first_album: bool
+  blank_unknown_track: bool
   noise_gate_db: float
   poll_seconds: int(5,600)
   device_name: match(^[a-z0-9_]+$)

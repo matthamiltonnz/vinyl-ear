@@ -33,7 +33,7 @@ Assistant hands to add-ons with `audio: true` — the same path that `parec` and
 
 | Entity | State | Attributes |
 | --- | --- | --- |
-| `sensor.vinyl_ear_<device_name>_now_playing` | `Artist - Title`, or `Nothing playing` after `silence_clear_seconds` seconds of silence | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `url`, `source`, `identified_at` |
+| `sensor.vinyl_ear_<device_name>_now_playing` | `Artist - Title`; `Artist - Album` while a record plays but the track is not recognised; `Nothing playing` after `silence_clear_seconds` seconds of silence | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `unknown_track`, `url`, `source`, `identified_at` |
 | `binary_sensor.vinyl_ear_<device_name>_audio_detected` | `ON` while the room is above the noise gate | — |
 
 `<device_name>` is the add-on option of the same name (`turntable` by default), and it
@@ -118,6 +118,12 @@ sampled four times a second rather than in bursts:
   can change album between lookups. The first album seen for an artist + title is
   remembered in `/data/albums.json` and reused (set `keep_first_album: false` to
   take Shazam at its word).
+- **Unidentified tracks never name the wrong song.** When a clip comes back empty while
+  the record keeps playing — an obscure pressing, a quiet passage, a spoken intro —
+  nothing has been silent for `silence_clear_seconds`, so the record cannot have been
+  changed: the artist, album and cover are kept and only the track name is dropped
+  (`title` empty, `unknown_track: true`, state `Artist - Album`). Set
+  `blank_unknown_track: false` to hold the last recognised title instead.
 - **Silence clears the state** after `silence_clear_seconds` — see
   [What it publishes](#what-it-publishes).
 - **`active_entity`**, when set, pauses all of the above unless that entity is `on`.
@@ -142,6 +148,7 @@ sampled four times a second rather than in bursts:
 | `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
 | `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
 | `keep_first_album` | `true` | A song can appear on several releases, and Shazam answers with whichever one its catalogue prefers — so the album can jump between lookups. Remember the album a song was first matched with (in `/data/albums.json`) and keep using it. Set `false` to always take Shazam's latest answer. |
+| `blank_unknown_track` | `true` | A clip Shazam cannot name keeps the album and blanks the track name instead of repeating the previous song. Set `false` to hold the last recognised title. |
 | `silence_clear_seconds` | `45` | How long the room must be judged quiet before the now-playing state is cleared (lifted needle, side change, record put away). |
 | `noise_gate_db` | `-45` | dBFS considered "not silence". Room noise sits near -60; music is well above. |
 | `poll_seconds` | `30` | Re-check interval while the music keeps playing. A new sound after a silent gap is recognised immediately, without waiting for this. |
@@ -187,9 +194,10 @@ style that paints the cover, artist, title and album over the stream.
   shazam2mqtt and ha_shazamio do it. It is free and needs no key, but it is unofficial:
   if it ever breaks, swap the client for ACRCloud or AudD behind the same interface.
 - Expect ~15-25 s from needle drop to a published track: 15 s of audio plus the lookup.
-- Quiet passages, spoken intros and private pressings may not match. The last known
-  track stays published until something new is recognised, so the dashboard never
-  blanks mid-side.
+- Quiet passages, spoken intros and private pressings may not match. Nothing has been
+  silent since the last match, so the album is kept and the track name is blanked
+  (`Artist - Album`, `unknown_track: true`) rather than repeating the previous song;
+  set `blank_unknown_track: false` to keep the last title instead.
 - Silence clears it: once the room is judged quiet for `silence_clear_seconds`
   seconds — needle lifted, side changed, record put away — the state is replaced with
   `Nothing playing` and the artwork and attributes are emptied, so the dashboard stops

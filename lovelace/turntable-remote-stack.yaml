@@ -18,8 +18,8 @@ card:
         {%- set year = state_attr(s, 'year') -%}
         {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
         <div style="font-size:0.95rem;opacity:0.6">Vinyl Ear is offline — is the add-on running?</div>
-        {%- elif artist and title -%}
-        <div style="font-size:1.05rem;font-weight:600;line-height:1.3">{{ artist }} — {{ title }}</div>
+        {%- elif artist or title or album -%}
+        <div style="font-size:1.05rem;font-weight:600;line-height:1.3">{{ artist }} — {{ title or 'track not identified' }}</div>
         {%- if album -%}
         <div style="font-size:0.85rem;opacity:0.65;margin-top:2px">{{ album }}{% if year %} · {{ year }}{% endif %}</div>
         {%- endif -%}

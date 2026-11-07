@@ -35,12 +35,12 @@ cards:
           {%- set year = state_attr(s, 'year') -%}
           {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
           <div style="display:inline-block;padding:14px 26px;border-radius:999px;background:rgba(8,10,16,0.66);color:rgba(255,255,255,0.72);font-size:1.05rem">Vinyl Ear is offline — is the add-on running?</div>
-          {%- elif artist and title -%}
+          {%- elif artist or title or album -%}
           <div style="display:flex;align-items:center;gap:30px;padding:22px 34px;border-radius:26px;background:rgba(8,10,16,0.62);box-shadow:0 12px 44px rgba(0,0,0,0.5)">
           {%- if art -%}<img src="{{ art }}" width="132" height="132" style="display:block;border-radius:16px;flex:0 0 auto">{%- endif -%}
           <div style="min-width:0">
           <div style="font-size:2.1rem;font-weight:700;line-height:1.12;color:#fff">{{ artist }}</div>
-          <div style="font-size:1.45rem;line-height:1.25;color:rgba(255,255,255,0.86);margin-top:8px">{{ title }}</div>
+          <div style="font-size:1.45rem;line-height:1.25;color:rgba(255,255,255,0.86);margin-top:8px">{{ title or 'track not identified' }}</div>
           {%- if album -%}
           <div style="font-size:1.05rem;letter-spacing:0.02em;color:rgba(255,255,255,0.58);margin-top:12px">{{ album }}{% if year %} · {{ year }}{% endif %}</div>
           {%- endif -%}

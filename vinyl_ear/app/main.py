@@ -34,7 +34,7 @@ from shazamio import Shazam
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -67,6 +67,7 @@ class Config:
     listen_seconds: int
     silence_clear_seconds: int
     keep_first_album: bool
+    blank_unknown_track: bool
     noise_gate_db: float
     poll_seconds: int
     device_name: str
@@ -97,6 +98,7 @@ def load_config() -> Config:
         listen_seconds=int(raw.get("listen_seconds", 15)),
         silence_clear_seconds=int(raw.get("silence_clear_seconds") or 45),
         keep_first_album=bool(raw.get("keep_first_album", True)),
+        blank_unknown_track=bool(raw.get("blank_unknown_track", True)),
         noise_gate_db=float(raw.get("noise_gate_db", -45)),
         poll_seconds=int(raw.get("poll_seconds", 30)),
         device_name=str(raw.get("device_name", "turntable")).strip() or "turntable",
@@ -331,6 +333,7 @@ def parse_track(response: dict[str, Any], device_name: str) -> dict[str, Any] | 
     return {
         "display": f"{artist} - {title}" if artist and title else (title or artist or "Unknown track"),
         "title": title,
+        "unknown_track": False,
         "artist": artist,
         "album": metadata.get("album") or "",
         "year": metadata.get("released") or "",
@@ -398,6 +401,30 @@ def idle_track(device_name: str) -> dict[str, Any]:
         "url": "",
         "source": device_name,
         "identified_at": "",
+        "unknown_track": False,
+    }
+
+
+def unidentified_track(previous: dict[str, Any]) -> dict[str, Any]:
+    """What to publish when a clip above the gate was not recognised.
+
+    Nothing has been quiet for `silence_clear_seconds`, so the record on the platter has
+    not been changed and the artist, album and cover from the last identified track still
+    describe it. Only the track name is dropped: the sleeve is known, the song on it is
+    not, and naming the previous song would be a guess that the card states as fact.
+    """
+    artist = previous.get("artist") or ""
+    album = previous.get("album") or ""
+    if artist and album:
+        display = f"{artist} - {album}"
+    else:
+        display = artist or album or "Track not identified"
+    return {
+        **previous,
+        "display": display,
+        "title": "",
+        "url": "",
+        "unknown_track": True,
     }
 
 
@@ -511,6 +538,8 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     last_loud_at: float | None = None
     last_attempt_at = 0.0
     current_key: tuple[str, str] | None = None
+    last_track: dict[str, Any] | None = None
+    state_is_unidentified = False
     playing = False
     new_segment = True
     albums = load_album_store()
@@ -531,6 +560,8 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                     publish(client, playing_topic, "OFF")
                 if current_key is not None:
                     current_key = None
+                    last_track = None
+                    state_is_unidentified = False
                     publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
                     log.info("%s is off — cleared the now playing state", cfg.active_entity)
                 clip = bytearray()
@@ -593,6 +624,8 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
             if current_key is not None and (now - last_loud_at) >= cfg.silence_clear_seconds:
                 current_key = None
+                last_track = None
+                state_is_unidentified = False
                 publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
                 log.info(
                     "Silent for %ss — cleared the now playing state", cfg.silence_clear_seconds
@@ -618,13 +651,26 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                     log.info(
                         "Heard audio (%.0f dBFS) but Shazam did not recognise it", level
                     )
+                    if (
+                        cfg.blank_unknown_track
+                        and current_key is not None
+                        and last_track is not None
+                        and not state_is_unidentified
+                    ):
+                        publish(client, state_topic, json.dumps(unidentified_track(last_track)))
+                        state_is_unidentified = True
+                        log.info(
+                            "Unidentified track: keeping the album %r, blanking the track name",
+                            last_track.get("album") or "unknown",
+                        )
                 else:
                     key = (track["artist"], track["title"])
                     failures = 0
-                    if key == current_key:
+                    if key == current_key and not state_is_unidentified:
                         log.debug("Same track still playing: %s - %s", *key)
                     else:
                         current_key = key
+                        state_is_unidentified = False
                         if apply_album_preference(track, albums, cfg.keep_first_album):
                             log.info(
                                 "Song already known, keeping the first album: %s",
@@ -636,6 +682,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                             session, remote_artwork, cfg.device_name
                         )
                         track["artwork_remote"] = remote_artwork
+                        last_track = track
                         publish(client, state_topic, json.dumps(track))
                         log.info(
                             "Now playing: %s - %s (%s, %s)",
