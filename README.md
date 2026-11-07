@@ -33,12 +33,14 @@ Assistant hands to add-ons with `audio: true` — the same path that `parec` and
 
 | Entity | State | Attributes |
 | --- | --- | --- |
-| `sensor.vinyl_ear_turntable_now_playing` | `Artist - Title`, or `Nothing playing` after `silence_clear_seconds` seconds of silence | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `url`, `source`, `identified_at` |
-| `binary_sensor.vinyl_ear_turntable_audio_detected` | `ON` while the room is above the noise gate | — |
+| `sensor.vinyl_ear_<device_name>_now_playing` | `Artist - Title`, or `Nothing playing` after `silence_clear_seconds` seconds of silence | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `url`, `source`, `identified_at` |
+| `binary_sensor.vinyl_ear_<device_name>_audio_detected` | `ON` while the room is above the noise gate | — |
 
-Entity ids follow the HA device name, so they carry the `vinyl_ear_` prefix; rename them
-in the UI if you want `sensor.turntable_now_playing`. Everything appears under one HA
-device named `Vinyl Ear (turntable)`, created by MQTT discovery — no YAML required.
+`<device_name>` is the add-on option of the same name (`turntable` by default), and it
+also names the MQTT topics under `vinyl_ear/<device_name>/`. Entity ids follow the HA
+device name, so they carry the `vinyl_ear_` prefix; rename them in the UI if you want
+`sensor.turntable_now_playing`. Everything appears under one HA device named
+`Vinyl Ear (<device_name>)`, created by MQTT discovery — no YAML required.
 
 Album artwork is downloaded to `/config/www/vinyl-art/<device_name>.jpg` and the
 `artwork` attribute points at `/local/vinyl-art/<device_name>.jpg?v=<epoch>` so every
