@@ -50,6 +50,56 @@ instead of Apple's CDN, whose URLs expire. The untouched CDN URL is kept in
 which is already declared; if the folder is not writable the remote URL is published as
 before.
 
+## Install
+
+[![Open your Home Assistant instance and add this add-on repository.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fmatthamiltonnz%2Fvinyl-ear)
+
+Click, pick your instance, confirm — then install. No terminal, no YAML. You need
+Home Assistant OS or Supervised (add-ons), and the **Mosquitto broker** add-on.
+
+1. **Add the repository** — the button above opens Home Assistant and asks to add this
+   repository; say yes. Typing it yourself works too: **Settings → Add-ons → Add-on
+   store → ⋮ → Repositories** and paste `https://github.com/matthamiltonnz/vinyl-ear`.
+2. **Install** — the store now lists **Vinyl Ear** under *Add-on repositories* (refresh
+   the store page if it looks empty). Open it and press **Install**.
+3. **Configure and start** — on the add-on's **Configuration** tab set `mqtt_user` and
+   `mqtt_password`, change `device_name` if you want something other than `turntable`,
+   then press **Start**.
+
+Watch the **Log** tab: it prints the PulseAudio source it chose and every match. The
+first lookup takes a few seconds while ffmpeg and Shazam warm up.
+
+<details>
+<summary>Running it as a local add-on instead (development)</summary>
+
+Copy the `vinyl_ear` folder to the Home Assistant host and reload the store — handy while
+editing the code, because the add-on then runs straight from disk:
+
+```bash
+scp -r vinyl_ear <ssh-user>@<home-assistant-host>:/addons/vinyl_ear
+```
+
+**Settings → Add-ons → Add-on store → ⋮ → Reload**, then install *Vinyl Ear* as above.
+A local add-on must be **Rebuilt** (not just restarted) after every code change.
+
+</details>
+
+## Before you trust the audio
+
+The webcam microphone must actually be listening. A USB webcam mic is usually turned
+right down in PulseAudio — one seen here was sitting at **12% (-55 dB)**, i.e. muted —
+and no amount of fingerprinting will fix that. List the sources and raise the one that
+is not a `.monitor`:
+
+```bash
+pactl list short sources
+pactl set-source-volume <source> 45%
+```
+
+45% measured about -25 dB mean / -8 dB peak on a record and matched within seconds, while
+70% clipped. Nothing else uses that mic (the go2rtc "Turntable" stream is video-only), so
+the gain can stay where you put it.
+
 ## Options
 
 The microphone is opened once and read continuously in 250 ms chunks, so the level is
@@ -101,46 +151,6 @@ sampled four times a second rather than in bursts:
 | `mqtt_user` / `mqtt_password` | *(empty)* | Leave empty for anonymous brokers. |
 | `discovery_prefix` | `homeassistant` | HA's MQTT discovery prefix. |
 | `log_level` | `info` | `debug` logs every capture attempt and the audio level. |
-
-## Before you trust the audio
-
-The webcam microphone must actually be listening. A USB webcam mic is usually turned
-right down in PulseAudio — one seen here was sitting at **12% (-55 dB)**, i.e. muted —
-and no amount of fingerprinting will fix that. List the sources and raise the one that
-is not a `.monitor`:
-
-```bash
-pactl list short sources
-pactl set-source-volume <source> 45%
-```
-
-45% measured about -25 dB mean / -8 dB peak on a record and matched within seconds, while
-70% clipped. Nothing else uses that mic (the go2rtc "Turntable" stream is video-only), so
-the gain can stay where you put it.
-
-## Install
-
-### From this repository (recommended)
-
-In Home Assistant: **Settings → Add-ons → Add-on store → ⋮ → Repositories**, add
-
-```
-https://github.com/matthamiltonnz/vinyl-ear
-```
-
-then close the dialog, refresh the store and install **Vinyl Ear**. Before pressing
-Start, open the **Configuration** tab and set `mqtt_user` / `mqtt_password`.
-
-### As a local add-on
-
-Copy the `vinyl_ear` folder to the Home Assistant host and reload the store:
-
-```bash
-scp -r vinyl_ear <ssh-user>@<home-assistant-host>:/addons/vinyl_ear
-```
-
-Then **Settings → Add-ons → Add-on store → ⋮ → Reload**, pick *Vinyl Ear*, install,
-paste your MQTT username/password in the configuration tab, and start it.
 
 ## Lovelace card
 
