@@ -141,7 +141,7 @@ Ready-made views live in [`lovelace/`](lovelace/):
 | `turntable-stack-view.yaml` | Safe fallback — metadata card above the stream, no `card_mod` |
 | `turntable-picture-elements-view.yaml` | Overlay via core `picture-elements` (needs a transparent backdrop image) |
 | `turntable-sections-view.yaml` | Sections view with the metadata in the view header |
-| `turntable-remote-stack.yaml` | One conditional card for a remote-control stack: artwork (32 %) beside the live camera, track details on a full width card underneath |
+| `turntable-remote-stack.yaml` | One conditional card for a remote-control stack: track details full width on top, a square (centre-cropped) view of the turntable camera underneath |
 
 If you edit the overlay card's CSS, note the line break escape is `\00000A`, not `\A`. A
 short hex escape swallows the next character when it is a hex digit — `\AB` becomes

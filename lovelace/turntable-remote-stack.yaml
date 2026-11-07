@@ -1,6 +1,5 @@
-# One conditional card for the Lounge Remote stack: artwork beside the live camera,
-# with the track details on a full width card underneath so the title has room.
-# Replaces the separate webrtc-camera and type: entity conditionals.
+# One conditional card for the Lounge Remote stack: the track details on a full width
+# card, with a square (centre-cropped) view of the turntable camera underneath.
 type: conditional
 conditions:
   - condition: state
@@ -9,22 +8,6 @@ conditions:
 card:
   type: vertical-stack
   cards:
-    - type: horizontal-stack
-      card_mod:
-        style: |
-          #root > *:nth-child(1) { flex: 0 0 32% !important; }
-          #root > *:nth-child(2) { flex: 1 1 68% !important; }
-      cards:
-        - type: markdown
-          content: >-
-            {%- set art = state_attr('sensor.vinyl_ear_turntable_now_playing', 'artwork') -%}
-            {%- if art -%}
-            <img src="{{ art }}" style="display:block;width:100%;border-radius:10px">
-            {%- else -%}
-            <div style="display:flex;align-items:center;justify-content:center;height:72px;font-size:1.6rem;opacity:0.3">♫</div>
-            {%- endif -%}
-        - type: custom:webrtc-camera
-          url: Turntable
     - type: markdown
       content: >-
         {%- set s = 'sensor.vinyl_ear_turntable_now_playing' -%}
@@ -42,3 +25,12 @@ card:
         {%- else -%}
         <div style="font-size:0.95rem;opacity:0.6">Nothing playing — drop the needle.</div>
         {%- endif -%}
+    - type: custom:webrtc-camera
+      url: Turntable
+      style: "video { object-fit: cover; }"
+      card_mod:
+        style: |
+          ha-card {
+            aspect-ratio: 1 / 1;
+            height: auto !important;
+          }
