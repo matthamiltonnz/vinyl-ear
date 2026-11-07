@@ -151,6 +151,12 @@ Ready-made views live in [`lovelace/`](lovelace/):
 | `turntable-sections-view.yaml` | Sections view with the metadata in the view header |
 | `turntable-remote-stack.yaml` | One conditional card for a remote-control stack: track details full width on top, a square (centre-cropped) view of the turntable camera underneath |
 
+The overlay card references the cached cover by a fixed path,
+`/local/vinyl-art/turntable.jpg` — change that path if `device_name` is not
+`turntable`. It is not a template on purpose: a Cast display evaluates the
+style once, often before the sensor has attributes, so a templated
+`background-image` is baked in empty and never appears.
+
 If you edit the overlay card's CSS, note the line break escape is `\00000A`, not `\A`. A
 short hex escape swallows the next character when it is a hex digit — `\AB` becomes
 U+0ABE and eats the `B`, which displays as `Laufey*lst Friend` instead of
