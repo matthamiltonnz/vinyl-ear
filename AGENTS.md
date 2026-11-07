@@ -148,6 +148,9 @@ the storage files under `/config/.storage` instead.
 7. Before pushing: `grep -rInE '([0-9]{1,3}\.){3}[0-9]{1,3}|@|alsa_input|ssh ' --exclude-dir=.git .`
    should return only `<...>` placeholders. The repo is public, so host addresses, emails,
    SSH users, mic source names and broker details must all stay in `AGENTS.local.md`.
+8. Commit identity must stay `matthamiltonnz <matthamiltonnz@users.noreply.github.com>`
+   (set repo-locally). A personal address crept into the first twelve commits and had to be
+   rewritten out; do not let one back in.
 
 ## Known limitations
 
