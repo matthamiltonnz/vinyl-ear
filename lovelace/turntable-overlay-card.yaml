@@ -1,3 +1,8 @@
+# Full screen camera with the now playing details painted over it (panel view).
+#
+# The artwork is referenced by a fixed path rather than through the template: a Cast
+# display renders the style once, often before the sensor carries any attributes, so a
+# templated background-image can be baked in empty and never appear.
 type: panel
 title: Turntable
 path: turntable
@@ -7,7 +12,6 @@ cards:
     card_mod:
       style: |
         {%- set s = 'sensor.vinyl_ear_turntable_now_playing' -%}
-        {%- set art = state_attr(s, 'artwork') -%}
         {%- set artist = state_attr(s, 'artist') -%}
         {%- set title = state_attr(s, 'title') -%}
         {%- set album = state_attr(s, 'album') -%}
@@ -22,20 +26,18 @@ cards:
         ha-card::after {
           content: "{{ lines }}";
           position: absolute;
+          display: block;
           top: 3.5%;
           left: 2.5%;
           max-width: 62%;
-          padding: 18px 26px;
+          padding: 18px 26px 18px 132px;
           border-radius: 20px;
           background-color: rgba(8, 10, 16, 0.66);
-          {% if art -%}
-          background-image: url('{{ art }}');
+          background-image: url('/local/vinyl-art/turntable.jpg');
           background-position: 22px center;
           background-size: 88px 88px;
           background-repeat: no-repeat;
-          padding-left: 132px;
           min-height: 88px;
-          {% endif -%}
           color: #ffffff;
           font-size: 1.45rem;
           font-weight: 600;

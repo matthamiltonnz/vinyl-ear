@@ -63,6 +63,11 @@ sampled four times a second rather than in bursts:
 - **While music continues**, it re-identifies every `poll_seconds` so a track change
   without a silent gap is still caught, and a repeat match of the same track is
   suppressed.
+- **Albums stick.** The same recording turns up on the original album, an EP and a
+  dozen compilations, and Shazam picks whichever its catalogue prefers, so a track
+  can change album between lookups. The first album seen for an artist + title is
+  remembered in `/data/albums.json` and reused (set `keep_first_album: false` to
+  take Shazam at its word).
 - **Silence clears the state** after `silence_clear_seconds` — see
   [What it publishes](#what-it-publishes).
 - **`active_entity`**, when set, pauses all of the above unless that entity is `on`.
@@ -86,6 +91,7 @@ sampled four times a second rather than in bursts:
 | `active_entity` | *(none)* | Listen only while this entity is `on`, e.g. `input_boolean.activity_turntable`. Empty means always listen. Read through the supervisor's Home Assistant API; if it cannot be read the add-on keeps listening. |
 | `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
 | `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
+| `keep_first_album` | `true` | A song can appear on several releases, and Shazam answers with whichever one its catalogue prefers — so the album can jump between lookups. Remember the album a song was first matched with (in `/data/albums.json`) and keep using it. Set `false` to always take Shazam's latest answer. |
 | `silence_clear_seconds` | `45` | How long the room must be judged quiet before the now-playing state is cleared (lifted needle, side change, record put away). |
 | `noise_gate_db` | `-45` | dBFS considered "not silence". Room noise sits near -60; music is well above. |
 | `poll_seconds` | `30` | Re-check interval while the music keeps playing. A new sound after a silent gap is recognised immediately, without waiting for this. |

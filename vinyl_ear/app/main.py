@@ -33,7 +33,8 @@ from shazamio import Shazam
 
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
-VERSION = "0.4.0"
+ALBUM_STORE = Path("/data/albums.json")
+VERSION = "0.5.0"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -65,6 +66,7 @@ class Config:
     sample_rate: int
     listen_seconds: int
     silence_clear_seconds: int
+    keep_first_album: bool
     noise_gate_db: float
     poll_seconds: int
     device_name: str
@@ -94,6 +96,7 @@ def load_config() -> Config:
         sample_rate=int(raw.get("sample_rate", 44100)),
         listen_seconds=int(raw.get("listen_seconds", 15)),
         silence_clear_seconds=int(raw.get("silence_clear_seconds") or 45),
+        keep_first_album=bool(raw.get("keep_first_album", True)),
         noise_gate_db=float(raw.get("noise_gate_db", -45)),
         poll_seconds=int(raw.get("poll_seconds", 30)),
         device_name=str(raw.get("device_name", "turntable")).strip() or "turntable",
@@ -340,8 +343,49 @@ def parse_track(response: dict[str, Any], device_name: str) -> dict[str, Any] | 
     }
 
 
+def load_album_store() -> dict[str, dict[str, str]]:
+    """Songs seen before, with the album first matched for each."""
+    try:
+        data = json.loads(ALBUM_STORE.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_album_store(store: dict[str, dict[str, str]]) -> None:
+    try:
+        ALBUM_STORE.write_text(json.dumps(store, indent=1, sort_keys=True))
+    except OSError as err:
+        log.warning("Could not save the album memory (%s); it will be rebuilt", err)
+
+
+def apply_album_preference(
+    track: dict[str, Any], store: dict[str, dict[str, str]], keep_first: bool
+) -> bool:
+    """Pin a song to the album it was first matched with.
+
+    Shazam answers with whichever release its catalogue prefers, so the same track can
+    jump between the album and a compilation between lookups. Remember the first album
+    per artist+title (persisted in the add-on data folder) and reuse it.
+    """
+    key = f"{track['artist'].strip().casefold()}|{track['title'].strip().casefold()}"
+    remembered = store.get(key)
+    if remembered is None:
+        store[key] = {"album": track["album"], "year": track["year"]}
+        return False
+    if not keep_first:
+        store[key] = {"album": track["album"], "year": track["year"]}
+        return False
+    if remembered.get("album") and remembered["album"] != track["album"]:
+        previous = track["album"]
+        track["album"] = remembered["album"]
+        track["year"] = remembered.get("year") or track["year"]
+        log.debug("Kept album %r instead of %r", track["album"], previous)
+        return True
+    return False
+
+
 def idle_track(device_name: str) -> dict[str, Any]:
-    """State published once the room has been silent long enough to assume a stop."""
     return {
         "display": "Nothing playing",
         "title": "",
@@ -469,6 +513,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     current_key: tuple[str, str] | None = None
     playing = False
     new_segment = True
+    albums = load_album_store()
     levels: collections.deque[float] = collections.deque(maxlen=LEVELS_WINDOW)
     threshold = cfg.noise_gate_db
     failures = 0
@@ -580,6 +625,12 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                         log.debug("Same track still playing: %s - %s", *key)
                     else:
                         current_key = key
+                        if apply_album_preference(track, albums, cfg.keep_first_album):
+                            log.info(
+                                "Song already known, keeping the first album: %s",
+                                track["album"],
+                            )
+                        save_album_store(albums)
                         remote_artwork = track["artwork"]
                         track["artwork"] = await cache_artwork(
                             session, remote_artwork, cfg.device_name
