@@ -33,7 +33,7 @@ Assistant hands to add-ons with `audio: true` — the same path that `parec` and
 
 | Entity | State | Attributes |
 | --- | --- | --- |
-| `sensor.vinyl_ear_turntable_now_playing` | `Artist - Title`, or `Nothing playing` after `capture_timeout` seconds of silence | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `url`, `source`, `identified_at` |
+| `sensor.vinyl_ear_turntable_now_playing` | `Artist - Title`, or `Nothing playing` after `silence_clear_seconds` seconds of silence | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `url`, `source`, `identified_at` |
 | `binary_sensor.vinyl_ear_turntable_audio_detected` | `ON` while the room is above the noise gate | — |
 
 Entity ids follow the HA device name, so they carry the `vinyl_ear_` prefix; rename them
@@ -61,9 +61,22 @@ sampled four times a second rather than in bursts:
 - **While music continues**, it re-identifies every `poll_seconds` so a track change
   without a silent gap is still caught, and a repeat match of the same track is
   suppressed.
-- **Silence clears the state** after `capture_timeout` seconds — see
+- **Silence clears the state** after `silence_clear_seconds` — see
   [What it publishes](#what-it-publishes).
 - **`active_entity`**, when set, pauses all of the above unless that entity is `on`.
+- **The activity threshold adapts to the room.** `noise_gate_db` is only a floor: the
+  listener measures the quiet tenth percentile of the last 30 seconds and raises the
+  threshold to 6 dB above it, so a fridge, fan or amplifier hiss that sits above the
+  fixed gate stops looking like a record that never ends. It only recalibrates while
+  the room is quiet, or when the audio is steady and Shazam has already failed to name
+  it, so music isn't mistaken for noise. The log says `Room noise floor ~-35 dBFS,
+  activity threshold now -29 dBFS` when it moves.
+- **Repeated misses back off.** After failed lookups the interval doubles, capping at
+  five minutes, so an unrecognisable record doesn't burn a lookup every 30 seconds. A
+  fresh silence → sound transition resets it.
+- **Every five minutes** the log reports the level, the current threshold, whether it
+  thinks audio is playing and how many attempts have failed — the numbers you need to
+  tune `noise_gate_db` if the room is unusually noisy.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -71,7 +84,7 @@ sampled four times a second rather than in bursts:
 | `active_entity` | *(none)* | Listen only while this entity is `on`, e.g. `input_boolean.activity_turntable`. Empty means always listen. Read through the supervisor's Home Assistant API; if it cannot be read the add-on keeps listening. |
 | `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
 | `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
-| `capture_timeout` | `60` | Seconds of silence before an attempt gives up — this is also how long the room must be quiet before the now-playing state is cleared (lifted needle, side change, record put away). |
+| `silence_clear_seconds` | `45` | How long the room must be judged quiet before the now-playing state is cleared (lifted needle, side change, record put away). |
 | `noise_gate_db` | `-45` | dBFS considered "not silence". Room noise sits near -60; music is well above. |
 | `poll_seconds` | `30` | Re-check interval while the music keeps playing. A new sound after a silent gap is recognised immediately, without waiting for this. |
 | `device_name` | `turntable` | Node name for topics and entity IDs. |
@@ -150,7 +163,7 @@ style that paints the cover, artist, title and album over the stream.
 - Quiet passages, spoken intros and private pressings may not match. The last known
   track stays published until something new is recognised, so the dashboard never
   blanks mid-side.
-- Silence clears it: once nothing above the noise gate is heard for `capture_timeout`
+- Silence clears it: once the room is judged quiet for `silence_clear_seconds`
   seconds — needle lifted, side changed, record put away — the state is replaced with
   `Nothing playing` and the artwork and attributes are emptied, so the dashboard stops
   claiming a track that finished minutes ago.

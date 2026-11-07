@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import array
 import asyncio
+import collections
 import dataclasses
 import json
 import logging
@@ -17,6 +18,7 @@ import math
 import os
 import shutil
 import signal
+import statistics
 import subprocess
 import tempfile
 import threading
@@ -31,12 +33,18 @@ from shazamio import Shazam
 
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
+VERSION = "0.4.0"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
 PREBUFFER_SECONDS = 1.5
 SILENCE_DEBOUNCE_SECONDS = 2.0
 ACTIVE_CHECK_SECONDS = 5.0
+SILENCE_MARGIN_DB = 6.0
+CALIBRATION_SECONDS = 1.0
+LEVELS_WINDOW = int(30 / CHUNK_SECONDS)
+MAX_COOLDOWN_SECONDS = 300.0
+HEARTBEAT_SECONDS = 300.0
 
 log = logging.getLogger("vinyl_ear")
 stop = threading.Event()
@@ -46,13 +54,17 @@ class CaptureError(RuntimeError):
     """Raised when the PulseAudio capture stream cannot be opened or dies."""
 
 
+class GateUnavailable(RuntimeError):
+    """The supervisor will not let this add-on read Home Assistant states."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     source: str
     active_entity: str
     sample_rate: int
     listen_seconds: int
-    capture_timeout: int
+    silence_clear_seconds: int
     noise_gate_db: float
     poll_seconds: int
     device_name: str
@@ -81,7 +93,7 @@ def load_config() -> Config:
         active_entity=str(raw.get("active_entity") or "").strip(),
         sample_rate=int(raw.get("sample_rate", 44100)),
         listen_seconds=int(raw.get("listen_seconds", 15)),
-        capture_timeout=int(raw.get("capture_timeout", 60)),
+        silence_clear_seconds=int(raw.get("silence_clear_seconds") or 45),
         noise_gate_db=float(raw.get("noise_gate_db", -45)),
         poll_seconds=int(raw.get("poll_seconds", 30)),
         device_name=str(raw.get("device_name", "turntable")).strip() or "turntable",
@@ -96,6 +108,31 @@ def load_config() -> Config:
 
 def rms_to_dbfs(rms: float) -> float:
     return 20.0 * math.log10(max(rms, 1e-9) / FULL_SCALE)
+
+
+def quiet_percentile(levels: "collections.deque[float]") -> float:
+    """Tenth percentile of the recent levels: what the room sounds like when it is quiet."""
+    ordered = sorted(levels)
+    return ordered[len(ordered) // 10] if ordered else -120.0
+
+
+def calibrate_threshold(
+    levels: "collections.deque[float]", cfg: Config, playing: bool, failures: int
+) -> float | None:
+    """Derive an activity threshold from the room, or None to keep the current one.
+
+    A fixed gate is useless in a room whose fan or amplifier sits above it: the
+    listener then sees "audio" forever, never identifies anything, and never clears.
+    Learn the quiet level instead, but only trust it while the room is quiet, or when
+    the audio is steady and Shazam has already failed to name it a couple of times.
+    """
+    if len(levels) < 40:  # about ten seconds
+        return None
+    steady = statistics.pstdev(levels) < 3.0
+    if playing and (failures == 0 or not steady):
+        return None
+    wanted = quiet_percentile(levels) + SILENCE_MARGIN_DB
+    return min(max(wanted, cfg.noise_gate_db), cfg.noise_gate_db + 25.0)
 
 
 def find_source(cfg: Config) -> str:
@@ -183,17 +220,17 @@ async def supervised_entity_is_on(session: aiohttp.ClientSession, entity_id: str
     """Read an entity state through the supervisor's Home Assistant API proxy."""
     token = os.environ.get("SUPERVISOR_TOKEN", "")
     if not token:
-        log.warning("No SUPERVISOR_TOKEN, ignoring active_entity")
-        return True
+        raise GateUnavailable("no SUPERVISOR_TOKEN in this container")
     url = f"http://supervisor/core/api/states/{entity_id}"
     async with session.get(
         url,
         headers={"Authorization": f"Bearer {token}"},
         timeout=aiohttp.ClientTimeout(total=10),
     ) as response:
+        if response.status in (401, 403):
+            raise GateUnavailable(f"HTTP {response.status}")
         if response.status != 200:
-            log.warning("Could not read %s (HTTP %s)", entity_id, response.status)
-            return True
+            raise RuntimeError(f"HTTP {response.status}")
         payload = await response.json()
     return payload.get("state") == "on"
 
@@ -202,11 +239,24 @@ async def watch_active_entity(
     cfg: Config, session: aiohttp.ClientSession, flag: dict[str, bool]
 ) -> None:
     """Keep flag['active'] in step with the configured entity."""
+    failures = 0
     while not stop.is_set():
         try:
             flag["active"] = await supervised_entity_is_on(session, cfg.active_entity)
+            failures = 0
+        except GateUnavailable as err:
+            log.error(
+                "Cannot read %s (%s); listening continuously instead. The entity gate "
+                "needs homeassistant_api: true in the add-on configuration.",
+                cfg.active_entity,
+                err,
+            )
+            flag["active"] = True
+            return
         except Exception as err:  # noqa: BLE001 - fail open rather than stop listening
-            log.warning("Active entity check failed (%s); assuming active", err)
+            failures += 1
+            if failures == 1 or failures % 60 == 0:
+                log.warning("Active entity check failed (%s); assuming active", err)
             flag["active"] = True
         await asyncio.sleep(ACTIVE_CHECK_SECONDS)
 
@@ -419,6 +469,11 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     current_key: tuple[str, str] | None = None
     playing = False
     new_segment = True
+    levels: collections.deque[float] = collections.deque(maxlen=LEVELS_WINDOW)
+    threshold = cfg.noise_gate_db
+    failures = 0
+    last_calibration = 0.0
+    last_heartbeat = time.monotonic()
 
     try:
         while not stop.is_set():
@@ -438,13 +493,31 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 continue
 
             level = chunk_level(data)
+            levels.append(level)
+
+            if now - last_calibration >= CALIBRATION_SECONDS:
+                last_calibration = now
+                calibrated = calibrate_threshold(levels, cfg, playing, failures)
+                if calibrated is not None and abs(calibrated - threshold) >= 1.0:
+                    threshold = calibrated
+                    log.info(
+                        "Room noise floor ~%.0f dBFS, activity threshold now %.0f dBFS",
+                        quiet_percentile(levels),
+                        threshold,
+                    )
+
             gap = last_loud_at is None or (now - last_loud_at) >= GAP_SECONDS
 
-            if level >= cfg.noise_gate_db:
+            if level >= threshold:
                 if gap:
                     clip = bytearray(prebuffer) + data
                     new_segment = True
-                    log.debug("Audio at %.0f dBFS — starting a clip", level)
+                    failures = 0
+                    log.debug(
+                        "Audio at %.0f dBFS (threshold %.0f) — starting a clip",
+                        level,
+                        threshold,
+                    )
                 elif len(clip) < listen_bytes * 3:
                     clip.extend(data)
                 last_loud_at = now
@@ -463,14 +536,28 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if len(prebuffer) > prebuffer_bytes:
                 del prebuffer[: len(prebuffer) - prebuffer_bytes]
 
-            if current_key is not None and (now - last_loud_at) >= cfg.capture_timeout:
+            if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                last_heartbeat = now
+                log.info(
+                    "Room level %.0f dBFS (threshold %.0f), playing=%s, failures=%d",
+                    level,
+                    threshold,
+                    playing,
+                    failures,
+                )
+
+            if current_key is not None and (now - last_loud_at) >= cfg.silence_clear_seconds:
                 current_key = None
                 publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
                 log.info(
-                    "Silent for %ss — cleared the now playing state", cfg.capture_timeout
+                    "Silent for %ss — cleared the now playing state", cfg.silence_clear_seconds
                 )
 
-            cooldown = 0.0 if new_segment else float(cfg.poll_seconds)
+            cooldown = (
+                0.0
+                if new_segment
+                else min(cfg.poll_seconds * (2 ** min(failures, 3)), MAX_COOLDOWN_SECONDS)
+            )
             if len(clip) >= listen_bytes and (now - last_attempt_at) >= cooldown:
                 last_attempt_at = now
                 new_segment = False
@@ -482,9 +569,13 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 prebuffer = bytearray()
 
                 if track is None:
-                    log.info("Heard audio but Shazam did not recognise it")
+                    failures += 1
+                    log.info(
+                        "Heard audio (%.0f dBFS) but Shazam did not recognise it", level
+                    )
                 else:
                     key = (track["artist"], track["title"])
+                    failures = 0
                     if key == current_key:
                         log.debug("Same track still playing: %s - %s", *key)
                     else:
@@ -521,7 +612,8 @@ def main() -> None:
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
     )
     log.info(
-        "Vinyl Ear 0.1.0 starting (device=%s, gate=%.0f dBFS, clip=%ss, poll=%ss)",
+        "Vinyl Ear %s starting (device=%s, gate=%.0f dBFS, clip=%ss, poll=%ss)",
+        VERSION,
         cfg.device_name,
         cfg.noise_gate_db,
         cfg.listen_seconds,
