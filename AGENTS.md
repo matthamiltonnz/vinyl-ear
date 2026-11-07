@@ -7,7 +7,7 @@ decoding; no framework, no tests directory.
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.6.4**.
+what the startup banner prints). Current: **0.6.5**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -121,6 +121,26 @@ Relevant cards on that installation:
    survives `GATE_HOLD_SECONDS` (1 s) below the gate, so a dip in the music cannot throw it
    away. The heartbeat prints floor, gate, the share of the last 30 s above the gate and
    how long ago Shazam was last asked, which is what made all of this diagnosable.
+   It was *not* enough for 0.6.4 in the field: a record started 8.5 h after boot, Shazam
+   refused one clip, and `calibrate_threshold()` raised the gate from -45 to -23 dBFS on a
+   2 min window of the record itself — above the music, which measures about -26. The
+   panel showed "Nothing playing" for seven minutes because only the loudest passages
+   crossed the gate, so clips never filled and, after `silence_clear_seconds`, the state
+   was cleared. `last_identified_at` is the boot time, not `None`, so "5 min without a
+   recognition" is true immediately whenever a record starts on an add-on that has been
+   up a while. Three guards now (0.6.5): the clock runs from `segment_started_at` (when
+   the current uninterrupted stretch of sound began) rather than from boot, a raise needs
+   `FLOOR_LEARN_FAILURES` (4) refusals from Shazam, and a raise is refused when the floor
+   it was measured from sits within `SILENCE_MARGIN_DB` of `music_level` (the median level
+   at which a track was last named) — a floor that close to the music is the record, not
+   the room. Keep that test on the *floor*, not on the gate: this room's hum is about
+   8-10 dB below the music, so the gate has to be allowed up to `floor + 6` (about -28)
+   once the record stops, or the hum keeps the state alive forever. Verified with a
+   scratch harness (fake clock, synthetic chunks - see *Testing without a turntable*): on the
+   deployed 0.6.4 the "music, nothing named" case raised the gate 40 s in and left the
+   state OFF; 0.6.5 does not raise, still raises for a genuine steady hum (after 5 min and
+   4 refusals instead of 40 s), and keeps the album of a side Shazam stops answering
+   mid-way.
 7. **The supervisor's Home Assistant API needs `homeassistant_api: true`.** Without it the
    `active_entity` poll returns 401; the code raises `GateUnavailable`, logs **once** and
    disables the gate instead of warning every 5 s.
@@ -151,6 +171,15 @@ Generate tones with `struct.pack("<h", …)`: amplitude 820 is about -35 dBFS, 3
 -22 dBFS. That is how the threshold calibration, the silence clearing and the back-off
 were verified.
 
+To exercise the time-based rules in seconds rather than hours, replace `module.time` with
+a shim whose `monotonic()` returns a mutable value and whose other attributes fall through
+to the real `time` module (`__getattr__`), have the fake `audio_reader` add
+`CHUNK_SECONDS` to it per chunk, and jump it forward before the first chunk to fake an
+add-on that has been up for hours. Without that jump `last_identified_at`, which is set
+at boot, makes "five minutes since the last recognition" false, and the interesting case
+(a record starting on an idle add-on) never happens. `mod.chunk_level()` already returns
+dBFS, do not feed it to `rms_to_dbfs()`.
+
 For MQTT, read retained payloads from inside the `homeassistant` container (it ships
 `paho`) using the credentials in `/config/.storage/core.config_entries`. There is no
 long-lived token, so Home Assistant's own state and API cannot be queried directly; use
@@ -160,8 +189,14 @@ the storage files under `/config/.storage` instead.
 
 1. Bump `VERSION` in `vinyl_ear/app/main.py` and `version:` in `vinyl_ear/config.yaml`.
 2. `python3 -m py_compile vinyl_ear/app/main.py` — there are no automated tests.
-3. `tar -czf - . | ssh <ssh-user>@<ha-host> 'sudo -n tar -xzf - -C /addons/vinyl_ear'` so
-   the local install matches the repo (both values are in `AGENTS.local.md`).
+3. `tar -czf - -C vinyl_ear . | ssh <ssh-user>@<ha-host> 'sudo -n tar -xzf - -C /addons/vinyl_ear'`
+   so the local install matches the repo (both values are in `AGENTS.local.md`). The
+   `-C vinyl_ear` matters: the add-on manifest has to land at `/addons/vinyl_ear/config.yaml`,
+   not at `/addons/vinyl_ear/vinyl_ear/config.yaml`. Omitting it is how the add-on directory
+   drifted to **0.5.0** while the running container was 0.6.4 — an unnoticed Rebuild would
+   have shipped a three-release-old listener. Check `sudo grep '^version' /addons/vinyl_ear/config.yaml`
+   and `sudo md5sum /addons/vinyl_ear/app/main.py` against the repo before claiming a release,
+   and `sudo ls /addons/vinyl_ear` for a stale nested `vinyl_ear/` left by the old command.
 4. Commit and push to https://github.com/matthamiltonnz/vinyl-ear (public — check the
    diff for anything installation specific first, see below).
 5. The user presses **Rebuild** on the add-on page; Lovelace changes land through an HA

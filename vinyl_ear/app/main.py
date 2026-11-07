@@ -18,6 +18,7 @@ import math
 import os
 import shutil
 import signal
+import statistics
 import subprocess
 import tempfile
 import threading
@@ -33,7 +34,7 @@ from shazamio import Shazam
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -52,6 +53,10 @@ NOISE_SPREAD_DB = 6.0
 FLOOR_WINDOW_SECONDS = 120.0
 # Stop learning the floor while a record is still being recognised.
 FLOOR_LEARN_AFTER_SECONDS = 300.0
+# ... and until Shazam has refused the same audio this many times. A record that has
+# only just started has not had its chance to be named yet, and 0.6.4 raised the gate
+# into a playing record because one failed lookup plus the time since boot was enough.
+FLOOR_LEARN_FAILURES = 4
 CALIBRATION_SECONDS = 1.0
 LEVELS_WINDOW = int(30 / CHUNK_SECONDS)
 FLOOR_WINDOW = int(FLOOR_WINDOW_SECONDS / CHUNK_SECONDS)
@@ -155,6 +160,8 @@ def calibrate_threshold(
     cfg: Config,
     since_match: float,
     current: float,
+    failures: int,
+    music_level: float | None,
 ) -> tuple[float, float] | None:
     """Return (floor, threshold), or None to keep the current threshold.
 
@@ -163,8 +170,11 @@ def calibrate_threshold(
     room instead, and be asymmetric about it: a lower gate only costs a Shazam call the
     back-off already handles, while a higher one can stop the record being heard at all.
     So the gate drops as soon as a steady floor is measured, and only rises after two
-    minutes of steady room *and* five minutes without recognising anything - a record
-    being named is not a noise floor, however compressed its master is.
+    minutes of steady room *and* five minutes of the same unrecognised sound *and* at
+    least FLOOR_LEARN_FAILURES refusals from Shazam - a record being named is not a noise
+    floor, however compressed its master is. A floor measured within SILENCE_MARGIN_DB of
+    the level at which this listener last named a track is refused outright: that is the
+    record, not the room, and a gate learned from it stops the record being heard.
     """
     floor = room_floor(levels)
     if floor is None:
@@ -173,8 +183,11 @@ def calibrate_threshold(
         max(floor + SILENCE_MARGIN_DB, cfg.noise_gate_db),
         cfg.noise_gate_db + 25.0,
     )
-    if wanted >= current - 1.0 and since_match < FLOOR_LEARN_AFTER_SECONDS:
-        return None
+    if wanted >= current - 1.0:
+        if since_match < FLOOR_LEARN_AFTER_SECONDS or failures < FLOOR_LEARN_FAILURES:
+            return None
+        if music_level is not None and floor > music_level - SILENCE_MARGIN_DB:
+            return None
     return floor, wanted
 
 
@@ -609,6 +622,12 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     current_key: tuple[str, str] | None = None
     last_track: dict[str, Any] | None = None
     last_identified_at: float = time.monotonic()
+    # When the current uninterrupted stretch of sound began. Learning a floor while a
+    # record is playing must not count the time since the add-on started as "nothing has
+    # been recognised for five minutes".
+    segment_started_at: float = last_identified_at
+    # Level (dBFS) at which Shazam last named a track: the gate must stay well below it.
+    music_level: float | None = None
     state_is_unidentified = False
     playing = False
     new_segment = True
@@ -626,8 +645,12 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     async def commit(key: tuple[str, str], track: dict[str, Any]) -> None:
         """Publish a track the listener is confident about."""
         nonlocal current_key, last_track, state_is_unidentified, last_identified_at
+        nonlocal music_level
         current_key = key
         last_identified_at = now
+        # Remember how loud the record that Shazam just named actually was, so the noise
+        # gate cannot be learned up into the music it is supposed to be listening for.
+        music_level = statistics.median(levels) if levels else None
         state_is_unidentified = False
         if apply_album_preference(track, albums, cfg.keep_first_album):
             log.info("Song already known, keeping the first album: %s", track["album"])
@@ -672,7 +695,12 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if now - last_calibration >= CALIBRATION_SECONDS:
                 last_calibration = now
                 calibrated = calibrate_threshold(
-                    floor_levels, cfg, now - last_identified_at, threshold
+                    floor_levels,
+                    cfg,
+                    now - max(last_identified_at, segment_started_at),
+                    threshold,
+                    failures,
+                    music_level,
                 )
                 if calibrated is not None:
                     floor, wanted = calibrated
@@ -692,6 +720,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                     clip = bytearray(prebuffer) + data
                     new_segment = True
                     failures = 0
+                    segment_started_at = now
                     log.debug(
                         "Audio at %.0f dBFS (threshold %.0f) — starting a clip",
                         level,

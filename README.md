@@ -140,11 +140,13 @@ sampled four times a second rather than in bursts:
   looking like a record that never ends. The floor is taken from a *two minute* window that
   is flat — tenth and ninetieth percentile within 6 dB — because noise is steady while
   music, even a compressed master, changes song and section. The gate falls as soon as a
-  lower floor is measured, but only rises once that window has been flat **and** nothing
-  has been recognised for five minutes: a record that keeps being named is never a noise
-  floor, and that also holds for the first five minutes after the add-on starts. The log
-  says `Room noise floor ~-30 dBFS (steady), activity threshold now -24 dBFS` when it
-  moves.
+  lower floor is measured, but only rises once that window has been flat, the listener
+  has been hearing the same uninterrupted sound for five minutes **and** Shazam has
+  refused it four times: a record that keeps being named is never a noise floor, and a
+  record that has just started has not had its chance yet. A floor measured within 6 dB
+  of the level at which a track was last named is refused outright — that is the record,
+  not the room. The log says `Room noise floor ~-30 dBFS (steady), activity threshold now
+  -24 dBFS` when it moves.
 - **A dip in the music is not the end of the track.** A clip survives up to a second below
   the gate before it is discarded, so the quiet bar of a track — or a chunk landing just
   under a slightly-too-high gate — cannot stop a lookup from ever happening.
