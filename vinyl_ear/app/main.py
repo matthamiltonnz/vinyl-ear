@@ -34,7 +34,7 @@ from shazamio import Shazam
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -615,11 +615,14 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if now - last_heartbeat >= HEARTBEAT_SECONDS:
                 last_heartbeat = now
                 log.info(
-                    "Room level %.0f dBFS (threshold %.0f), playing=%s, failures=%d",
+                    "Room level %.0f dBFS (threshold %.0f), playing=%s, failures=%d, "
+                    "holding=%s, last lookup %ds ago",
                     level,
                     threshold,
                     playing,
                     failures,
+                    (last_track or {}).get("display") or "nothing",
+                    int(now - last_attempt_at) if last_attempt_at else -1,
                 )
 
             if current_key is not None and (now - last_loud_at) >= cfg.silence_clear_seconds:
