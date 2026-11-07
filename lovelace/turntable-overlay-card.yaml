@@ -1,8 +1,10 @@
 # Full screen camera with the now playing details painted over it (panel view).
 #
-# The artwork is referenced by a fixed path rather than through the template: a Cast
-# display renders the style once, often before the sensor carries any attributes, so a
-# templated background-image can be baked in empty and never appear.
+# Home Assistant serves /local with `Cache-Control: public, max-age=2678400` (31 days),
+# 404s included, so a fixed artwork path pins whatever the Cast display first fetched —
+# usually a 404 from before the first match, which then never resolves. Use the
+# epoch-tagged `artwork` attribute instead: every new cover is a new URL, so the browser
+# has to fetch it, and the pill text updates on the same render.
 type: panel
 title: Turntable
 path: turntable
@@ -16,6 +18,7 @@ cards:
         {%- set title = state_attr(s, 'title') -%}
         {%- set album = state_attr(s, 'album') -%}
         {%- set year = state_attr(s, 'year') -%}
+        {%- set art = state_attr(s, 'artwork') -%}
         {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
         {%- set lines = 'Vinyl Ear is offline — is the add-on running?' -%}
         {%- elif artist or title or album -%}
@@ -33,7 +36,11 @@ cards:
           padding: 18px 26px 18px 132px;
           border-radius: 20px;
           background-color: rgba(8, 10, 16, 0.66);
+          {%- if art %}
+          background-image: url('{{ art }}');
+          {%- else %}
           background-image: url('/local/vinyl-art/turntable.jpg');
+          {%- endif %}
           background-position: 22px center;
           background-size: 88px 88px;
           background-repeat: no-repeat;

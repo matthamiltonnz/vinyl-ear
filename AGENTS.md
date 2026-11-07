@@ -88,10 +88,15 @@ Relevant cards on that installation:
    Chrome 92 it produced a "Configuration error" card while the frontend logged
    `SyntaxError: Unexpected token '{'` — a lazily loaded chunk that browser cannot parse.
    Prefer cards already proven on the target screen.
-5. **A Cast display renders a `card_mod` style once**, usually before the entity carries
-   attributes, so a templated `background-image` can be baked in empty and never appear.
-   The overlay pill therefore references the cover by a fixed path, not `{{ art }}`; the
-   text template still updates normally.
+5. **`/local` is cached for 31 days, 404s included.** `curl -I /local/…/x.jpg` returns
+   `Cache-Control: public, max-age=2678400`, and a *missing* file returns that same header
+   with a 404. A fixed artwork path (`/local/vinyl-art/<device_name>.jpg`) therefore pins
+   whatever the Cast display fetched first — usually a 404 from before the first match — and
+   it stays blank for a month however often the add-on rewrites the file behind it. The panel
+   pill now uses the epoch-tagged `artwork` attribute for `background-image` (a new URL per
+   cover, so the browser must refetch) and keeps the fixed path only as the fallback for when
+   the attribute is absent. The pill's text template updates normally on each state change,
+   so the style *is* re-rendered; it was the cache, not the renderer, that hid the cover.
 6. **A fixed noise gate is useless in a quiet-ish but not silent room.** At -45 dBFS in a
    -35 dBFS room every chunk counted as audio: the state never cleared and Shazam was
    called every 30 s on noise. `calibrate_threshold()` takes the tenth percentile of the
