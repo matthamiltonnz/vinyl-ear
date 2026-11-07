@@ -76,7 +76,7 @@ def load_config() -> Config:
         source=str(raw.get("source") or "").strip(),
         sample_rate=int(raw.get("sample_rate", 44100)),
         listen_seconds=int(raw.get("listen_seconds", 15)),
-        capture_timeout=int(raw.get("capture_timeout", 120)),
+        capture_timeout=int(raw.get("capture_timeout", 60)),
         noise_gate_db=float(raw.get("noise_gate_db", -45)),
         poll_seconds=int(raw.get("poll_seconds", 30)),
         device_name=str(raw.get("device_name", "turntable")).strip() or "turntable",
@@ -252,16 +252,37 @@ def parse_track(response: dict[str, Any], device_name: str) -> dict[str, Any] | 
             if key in {"album", "released", "genre"}:
                 metadata[key] = str(item.get("text") or "")
     images = track.get("images") or {}
+    artist = track.get("subtitle") or ""
+    title = track.get("title") or ""
     return {
-        "title": track.get("title") or "",
-        "artist": track.get("subtitle") or "",
+        "display": f"{artist} - {title}" if artist and title else (title or artist or "Unknown track"),
+        "title": title,
+        "artist": artist,
         "album": metadata.get("album") or "",
         "year": metadata.get("released") or "",
         "genre": metadata.get("genre") or "",
         "artwork": images.get("coverart") or images.get("background") or "",
+        "artwork_remote": "",
         "url": track.get("url") or "",
         "source": device_name,
         "identified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def idle_track(device_name: str) -> dict[str, Any]:
+    """State published once the room has been silent long enough to assume a stop."""
+    return {
+        "display": "Nothing playing",
+        "title": "",
+        "artist": "",
+        "album": "",
+        "year": "",
+        "genre": "",
+        "artwork": "",
+        "artwork_remote": "",
+        "url": "",
+        "source": device_name,
+        "identified_at": "",
     }
 
 
@@ -307,7 +328,7 @@ def publish_discovery(client: mqtt.Client, cfg: Config) -> None:
         "has_entity_name": True,
         "unique_id": f"vinyl_ear_{cfg.device_name}_now_playing",
         "state_topic": state_topic,
-        "value_template": "{{ value_json.artist }} - {{ value_json.title }}",
+        "value_template": "{{ value_json.display }}",
         "json_attributes_topic": state_topic,
         "availability_topic": f"{cfg.base_topic}/availability",
         "icon": "mdi:record-player",
@@ -381,7 +402,12 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if playing:
                 playing = False
                 publish(client, playing_topic, "OFF")
-                log.info("Silence — nothing playing")
+            if current_key is not None:
+                current_key = None
+                publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
+                log.info(
+                    "Silence for %ss — cleared the now playing state", cfg.capture_timeout
+                )
             await asyncio.sleep(1)
             continue
 

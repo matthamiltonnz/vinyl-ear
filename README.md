@@ -33,7 +33,7 @@ Assistant hands to add-ons with `audio: true` — the same path that `parec` and
 
 | Entity | State | Attributes |
 | --- | --- | --- |
-| `sensor.vinyl_ear_turntable_now_playing` | `Artist - Title` | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `url`, `source`, `identified_at` |
+| `sensor.vinyl_ear_turntable_now_playing` | `Artist - Title`, or `Nothing playing` after `capture_timeout` seconds of silence | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `url`, `source`, `identified_at` |
 | `binary_sensor.vinyl_ear_turntable_audio_detected` | `ON` while the room is above the noise gate | — |
 
 Entity ids follow the HA device name, so they carry the `vinyl_ear_` prefix; rename them
@@ -55,7 +55,7 @@ before.
 | `source` | *(auto)* | PulseAudio source name. Empty picks the first non-monitor input. |
 | `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
 | `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
-| `capture_timeout` | `120` | Give up and count it as silence after this many seconds without a clip. |
+| `capture_timeout` | `60` | Seconds of silence before an attempt gives up — this is also how long the room must be quiet before the now-playing state is cleared (lifted needle, side change, record put away). |
 | `noise_gate_db` | `-45` | dBFS considered "not silence". Room noise sits near -60; music is well above. |
 | `poll_seconds` | `30` | Pause between recognition attempts. |
 | `device_name` | `turntable` | Node name for topics and entity IDs. |
@@ -127,5 +127,9 @@ style that paints the cover, artist, title and album over the stream.
 - Quiet passages, spoken intros and private pressings may not match. The last known
   track stays published until something new is recognised, so the dashboard never
   blanks mid-side.
+- Silence clears it: once nothing above the noise gate is heard for `capture_timeout`
+  seconds — needle lifted, side changed, record put away — the state is replaced with
+  `Nothing playing` and the artwork and attributes are emptied, so the dashboard stops
+  claiming a track that finished minutes ago.
 - Recognition requests only happen while the room is above the noise gate, at most
   once every `poll_seconds`.
