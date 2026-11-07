@@ -33,7 +33,7 @@ from shazamio import Shazam
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -47,10 +47,14 @@ GATE_HOLD_SECONDS = 1.0
 # Noise barely moves over half a minute; music swings with every bar. Only a window
 # this flat is accepted as the noise floor.
 NOISE_SPREAD_DB = 6.0
+# The floor is measured over a longer window than the gate: noise is steady for minutes,
+# music - even heavily compressed music - changes song and section over two.
+FLOOR_WINDOW_SECONDS = 120.0
 # Stop learning the floor while a record is still being recognised.
 FLOOR_LEARN_AFTER_SECONDS = 300.0
 CALIBRATION_SECONDS = 1.0
 LEVELS_WINDOW = int(30 / CHUNK_SECONDS)
+FLOOR_WINDOW = int(FLOOR_WINDOW_SECONDS / CHUNK_SECONDS)
 # Shazam answers the same audio with different catalogue entries, so a track change
 # is only believed once it has been seen this many times within this many seconds.
 TRACK_CONFIRM_VOTES = 2
@@ -130,14 +134,14 @@ def rms_to_dbfs(rms: float) -> float:
 def room_floor(levels: "collections.deque[float]") -> float | None:
     """The quiet level of the room, or None when the window is not quiet.
 
-    Noise is steady: a fan, a fridge or amplifier hiss barely moves across half a
-    minute, so its tenth and ninetieth percentiles sit close together. Music swings
-    with every bar, so the tenth percentile of a music-heavy window is simply the
-    quiet part of the music - taking that for a noise floor is how the gate climbed
-    into the music and stopped the listener calling Shazam at all.
+    Noise is steady: a fan, a fridge or amplifier hiss barely moves across minutes, so
+    its tenth and ninetieth percentiles sit close together. Music - even a heavily
+    compressed master - changes song and section, so its tenth percentile is simply the
+    quiet part of the music; takingthat for a noise floor is how the gate climbed into
+    the music and stopped the listener calling Shazam at all.
     """
     window = sorted(levels)
-    if len(window) < LEVELS_WINDOW // 3:
+    if len(window) < FLOOR_WINDOW // 3:
         return None
     low = window[len(window) // 10]
     high = window[len(window) * 9 // 10]
@@ -147,17 +151,21 @@ def room_floor(levels: "collections.deque[float]") -> float | None:
 
 
 def calibrate_threshold(
-    levels: "collections.deque[float]", cfg: Config, since_match: float | None
+    levels: "collections.deque[float]",
+    cfg: Config,
+    since_match: float,
+    current: float,
 ) -> tuple[float, float] | None:
     """Return (floor, threshold), or None to keep the current threshold.
 
-    A fixed gate is useless in a room whose fan or amplifier sits above it: the
-    listener then sees 'audio' forever, never identifies anything and never settles.
-    Learn the room instead - but only from steady audio, and only while nothing has
-    been recognised for a while: a record that is being named is not a noise floor.
+    A fixed gate is useless in a room whose fan or amplifier sits above it: the listener
+    then sees 'audio' forever, never identifies anything and never settles. Learn the
+    room instead, and be asymmetric about it: a lower gate only costs a Shazam call the
+    back-off already handles, while a higher one can stop the record being heard at all.
+    So the gate drops as soon as a steady floor is measured, and only rises after two
+    minutes of steady room *and* five minutes without recognising anything - a record
+    being named is not a noise floor, however compressed its master is.
     """
-    if since_match is not None and since_match < FLOOR_LEARN_AFTER_SECONDS:
-        return None
     floor = room_floor(levels)
     if floor is None:
         return None
@@ -165,6 +173,8 @@ def calibrate_threshold(
         max(floor + SILENCE_MARGIN_DB, cfg.noise_gate_db),
         cfg.noise_gate_db + 25.0,
     )
+    if wanted >= current - 1.0 and since_match < FLOOR_LEARN_AFTER_SECONDS:
+        return None
     return floor, wanted
 
 
@@ -598,12 +608,13 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     last_attempt_at = 0.0
     current_key: tuple[str, str] | None = None
     last_track: dict[str, Any] | None = None
-    last_identified_at: float | None = None
+    last_identified_at: float = time.monotonic()
     state_is_unidentified = False
     playing = False
     new_segment = True
     albums = load_album_store()
     levels: collections.deque[float] = collections.deque(maxlen=LEVELS_WINDOW)
+    floor_levels: collections.deque[float] = collections.deque(maxlen=FLOOR_WINDOW)
     threshold = cfg.noise_gate_db
     failures = 0
     last_calibration = 0.0
@@ -656,13 +667,13 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
             level = chunk_level(data)
             levels.append(level)
+            floor_levels.append(level)
 
             if now - last_calibration >= CALIBRATION_SECONDS:
                 last_calibration = now
-                since_match = (
-                    None if last_identified_at is None else now - last_identified_at
+                calibrated = calibrate_threshold(
+                    floor_levels, cfg, now - last_identified_at, threshold
                 )
-                calibrated = calibrate_threshold(levels, cfg, since_match)
                 if calibrated is not None:
                     floor, wanted = calibrated
                     if abs(wanted - threshold) >= 1.0:

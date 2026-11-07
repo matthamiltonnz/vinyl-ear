@@ -137,13 +137,14 @@ sampled four times a second rather than in bursts:
 - **The activity threshold adapts to the room, without eating the music.**
   `noise_gate_db` is only a floor: the listener learns the room's own noise level and sits
   6 dB above it, so a fridge, fan or amplifier hiss that is above the fixed gate stops
-  looking like a record that never ends. Noise is *steady* and music is not, so a window
-  only counts as noise when its tenth and ninetieth percentiles are within 6 dB of each
-  other, and the floor is only re-learned while nothing has been recognised for five
-  minutes. That is what keeps the gate out of the music: the tenth percentile of a
-  music-heavy half minute is the quiet part of the music, and treating it as a floor is
-  how the listener ends up hearing nothing at all. The log says `Room noise floor ~-30 dBFS
-  (steady), activity threshold now -24 dBFS` when it moves.
+  looking like a record that never ends. The floor is taken from a *two minute* window that
+  is flat — tenth and ninetieth percentile within 6 dB — because noise is steady while
+  music, even a compressed master, changes song and section. The gate falls as soon as a
+  lower floor is measured, but only rises once that window has been flat **and** nothing
+  has been recognised for five minutes: a record that keeps being named is never a noise
+  floor, and that also holds for the first five minutes after the add-on starts. The log
+  says `Room noise floor ~-30 dBFS (steady), activity threshold now -24 dBFS` when it
+  moves.
 - **A dip in the music is not the end of the track.** A clip survives up to a second below
   the gate before it is discarded, so the quiet bar of a track — or a chunk landing just
   under a slightly-too-high gate — cannot stop a lookup from ever happening.

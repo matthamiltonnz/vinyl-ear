@@ -7,7 +7,7 @@ decoding; no framework, no tests directory.
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.6.3**.
+what the startup banner prints). Current: **0.6.4**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -105,12 +105,17 @@ Relevant cards on that installation:
    above the record's own dips, and because one chunk below the gate emptied the clip no
    lookup ever completed again (symptom: heartbeats and nothing else for ten minutes).
    Now `room_floor()` accepts a window only when its p10 and p90 are within
-   `NOISE_SPREAD_DB` (6 dB) — noise is steady, music is not — and
-   `calibrate_threshold()` only re-learns while nothing has been recognised for
-   `FLOOR_LEARN_AFTER_SECONDS` (5 min); a clip also survives `GATE_HOLD_SECONDS` (1 s)
-   below the gate, so a dip in the music cannot throw it away. The heartbeat prints floor,
-   gate and the share of the last 30 s above the gate, which is what made this
-   diagnosable.
+   `NOISE_SPREAD_DB` (6 dB) — noise is steady, music is not — over a
+   `FLOOR_WINDOW_SECONDS` (2 min) window, and `calibrate_threshold()` is asymmetric: a
+   *lower* gate is taken immediately (it only costs a lookup the back-off handles) while a
+   *higher* one needs five minutes without a single recognition
+   (`FLOOR_LEARN_AFTER_SECONDS`), starting at boot. Steadiness alone is not enough:
+   compressed pop is flat to within 1 dB for a whole side, and 0.6.3 learned a -28 dBFS
+   "floor" from a record that was playing (gate -22, above the music) on the first
+   calibration after a restart, because `last_identified_at` was `None` then. A clip also
+   survives `GATE_HOLD_SECONDS` (1 s) below the gate, so a dip in the music cannot throw it
+   away. The heartbeat prints floor, gate, the share of the last 30 s above the gate and
+   how long ago Shazam was last asked, which is what made all of this diagnosable.
 7. **The supervisor's Home Assistant API needs `homeassistant_api: true`.** Without it the
    `active_entity` poll returns 401; the code raises `GateUnavailable`, logs **once** and
    disables the gate instead of warning every 5 s.
