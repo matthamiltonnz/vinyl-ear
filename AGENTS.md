@@ -7,7 +7,7 @@ decoding; no framework, no tests directory.
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.6.1**.
+what the startup banner prints). Current: **0.6.2**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -166,7 +166,12 @@ the storage files under `/config/.storage` instead.
   `unknown_track: true`) because no `silence_clear_seconds` gap has passed — so a side
   change with less than that much quiet keeps the previous album until the state clears.
 - Album and year come from Shazam's catalogue, not the physical pressing;
-  `keep_first_album` keeps the first answer but cannot know the sleeve in your hand.
+  `keep_first_album` keeps the first answer but cannot know the sleeve in your hand. The
+  same recording also comes back under different names and releases (`Tubular Bells, Pt. 1`
+  vs `Tubular Bells (Two Sides Excerpt)`, seen alternating on one side), so a *change* of
+  track is only published after `TRACK_CONFIRM_VOTES` sightings inside
+  `TRACK_CONFIRM_SECONDS` (`agreed_track()`), and pinning the first title would pin
+  whichever variant Shazam happened to answer first — do not add a `keep_first_title`.
 - The square camera tile relies on `aspect-ratio` plus `object-fit: cover`; if a client
   letterboxes instead, that is where to look.
 - Artwork beside a second live camera would mean two WebRTC sessions of the same stream,

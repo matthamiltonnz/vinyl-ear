@@ -113,6 +113,13 @@ sampled four times a second rather than in bursts:
 - **While music continues**, it re-identifies every `poll_seconds` so a track change
   without a silent gap is still caught, and a repeat match of the same track is
   suppressed.
+- **A track change has to be confirmed.** Shazam names the same audio differently from
+  one lookup to the next — the single, a deluxe re-release, a compilation — so a single
+  answer is not treated as a new track: the name only replaces what is on the display
+  after it has been heard twice within three minutes (at the default `poll_seconds` that
+  is one extra poll, about 30 s). The first answer after silence clears the state is
+  published straight away, because the alternative is a blank card, and any later
+  disagreement corrects it.
 - **Albums stick.** The same recording turns up on the original album, an EP and a
   dozen compilations, and Shazam picks whichever its catalogue prefers, so a track
   can change album between lookups. The first album seen for an artist + title is
@@ -138,8 +145,10 @@ sampled four times a second rather than in bursts:
   five minutes, so an unrecognisable record doesn't burn a lookup every 30 seconds. A
   fresh silence → sound transition resets it.
 - **Every five minutes** the log reports the level, the current threshold, whether it
-  thinks audio is playing and how many attempts have failed — the numbers you need to
-  tune `noise_gate_db` if the room is unusually noisy.
+  thinks audio is playing, how many attempts have failed, which track it is holding and
+  how long ago it last asked Shazam — the numbers you need to tune `noise_gate_db` if the
+  room is unusually noisy, and the quickest way to tell a silent room from a stuck
+  listener.
 
 | Option | Default | Meaning |
 | --- | --- | --- |

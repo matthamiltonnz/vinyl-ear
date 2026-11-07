@@ -34,7 +34,7 @@ from shazamio import Shazam
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -44,6 +44,11 @@ ACTIVE_CHECK_SECONDS = 5.0
 SILENCE_MARGIN_DB = 6.0
 CALIBRATION_SECONDS = 1.0
 LEVELS_WINDOW = int(30 / CHUNK_SECONDS)
+# Shazam answers the same audio with different catalogue entries, so a track change
+# is only believed once it has been seen this many times within this many seconds.
+TRACK_CONFIRM_VOTES = 2
+TRACK_CONFIRM_SECONDS = 180.0
+TRACK_CONFIRM_LOOKBACK = 4
 MAX_COOLDOWN_SECONDS = 300.0
 HEARTBEAT_SECONDS = 300.0
 
@@ -428,6 +433,37 @@ def unidentified_track(previous: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def track_identity(track: dict[str, Any]) -> tuple[str, str]:
+    """The pair that decides whether two answers describe the same song."""
+    return (
+        str(track.get("artist") or "").strip().casefold(),
+        str(track.get("title") or "").strip().casefold(),
+    )
+
+
+def agreed_track(
+    recent: "collections.deque[tuple[float, tuple[str, str], dict[str, Any]]]",
+    displayed: tuple[str, str] | None,
+    now: float,
+) -> tuple[tuple[str, str], dict[str, Any]] | None:
+    """An answer heard twice recently that is not what the display already shows.
+
+    Shazam names the same audio differently from one lookup to the next - the single,
+    a deluxe re-release, a compilation - so one answer is no evidence that the track
+    changed, and the first answer of a side is not automatically the truth either.
+    Two sightings inside `TRACK_CONFIRM_SECONDS` are evidence; the newest of them is
+    the one worth publishing.
+    """
+    fresh = [key for stamp, key, _ in recent if now - stamp <= TRACK_CONFIRM_SECONDS]
+    sightings = collections.Counter(fresh)
+    for stamp, key, track in reversed(recent):
+        if now - stamp > TRACK_CONFIRM_SECONDS:
+            continue
+        if sightings[key] >= TRACK_CONFIRM_VOTES and key != displayed:
+            return key, track
+    return None
+
+
 def device_block(cfg: Config) -> dict[str, Any]:
     return {
         "identifiers": [f"vinyl_ear_{cfg.device_name}"],
@@ -548,6 +584,30 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     failures = 0
     last_calibration = 0.0
     last_heartbeat = time.monotonic()
+    recent: collections.deque[tuple[float, tuple[str, str], dict[str, Any]]] = (
+        collections.deque(maxlen=TRACK_CONFIRM_LOOKBACK)
+    )
+
+    async def commit(key: tuple[str, str], track: dict[str, Any]) -> None:
+        """Publish a track the listener is confident about."""
+        nonlocal current_key, last_track, state_is_unidentified
+        current_key = key
+        state_is_unidentified = False
+        if apply_album_preference(track, albums, cfg.keep_first_album):
+            log.info("Song already known, keeping the first album: %s", track["album"])
+        save_album_store(albums)
+        remote_artwork = track["artwork"]
+        track["artwork"] = await cache_artwork(session, remote_artwork, cfg.device_name)
+        track["artwork_remote"] = remote_artwork
+        last_track = track
+        publish(client, state_topic, json.dumps(track))
+        log.info(
+            "Now playing: %s - %s (%s, %s)",
+            track["artist"] or "?",
+            track["title"] or "?",
+            track["album"] or "unknown album",
+            track["year"] or "unknown year",
+        )
 
     try:
         while not stop.is_set():
@@ -561,6 +621,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 if current_key is not None:
                     current_key = None
                     last_track = None
+                    recent.clear()
                     state_is_unidentified = False
                     publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
                     log.info("%s is off — cleared the now playing state", cfg.active_entity)
@@ -628,6 +689,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if current_key is not None and (now - last_loud_at) >= cfg.silence_clear_seconds:
                 current_key = None
                 last_track = None
+                recent.clear()
                 state_is_unidentified = False
                 publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
                 log.info(
@@ -667,33 +729,32 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                             last_track.get("album") or "unknown",
                         )
                 else:
-                    key = (track["artist"], track["title"])
+                    key = track_identity(track)
                     failures = 0
-                    if key == current_key and not state_is_unidentified:
-                        log.debug("Same track still playing: %s - %s", *key)
+                    if key == current_key:
+                        if state_is_unidentified:
+                            # Same sleeve as the display: put the name back.
+                            await commit(key, track)
+                        else:
+                            log.debug("Same track still playing: %s - %s", *key)
+                        recent.clear()
+                    elif current_key is None:
+                        # Nothing on the display, so a first answer beats a blank card;
+                        # a later, different answer corrects it.
+                        await commit(key, track)
+                        recent.clear()
                     else:
-                        current_key = key
-                        state_is_unidentified = False
-                        if apply_album_preference(track, albums, cfg.keep_first_album):
-                            log.info(
-                                "Song already known, keeping the first album: %s",
-                                track["album"],
+                        recent.append((now, key, track))
+                        agreed = agreed_track(recent, current_key, now)
+                        if agreed is None:
+                            log.debug(
+                                "Heard %s - %s; waiting for a second look",
+                                track["artist"] or "?",
+                                track["title"] or "?",
                             )
-                        save_album_store(albums)
-                        remote_artwork = track["artwork"]
-                        track["artwork"] = await cache_artwork(
-                            session, remote_artwork, cfg.device_name
-                        )
-                        track["artwork_remote"] = remote_artwork
-                        last_track = track
-                        publish(client, state_topic, json.dumps(track))
-                        log.info(
-                            "Now playing: %s - %s (%s, %s)",
-                            track["artist"] or "?",
-                            track["title"] or "?",
-                            track["album"] or "unknown album",
-                            track["year"] or "unknown year",
-                        )
+                        else:
+                            await commit(*agreed)
+                            recent.clear()
     finally:
         reader.cancel()
         if watcher is not None:
