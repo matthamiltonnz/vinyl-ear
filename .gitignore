@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.wav
 .venv/
+
+# Local only, never committed: host addresses, SSH user, microphone source,
+# broker address. This repository is public - keep installation specifics out.
+AGENTS.local.md

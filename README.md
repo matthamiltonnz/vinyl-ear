@@ -96,7 +96,7 @@ sampled four times a second rather than in bursts:
 | `noise_gate_db` | `-45` | dBFS considered "not silence". Room noise sits near -60; music is well above. |
 | `poll_seconds` | `30` | Re-check interval while the music keeps playing. A new sound after a silent gap is recognised immediately, without waiting for this. |
 | `device_name` | `turntable` | Node name for topics and entity IDs. |
-| `mqtt_host` | `core-mosquitto` | Broker. Use `<ha-host>` if you prefer the LAN address. |
+| `mqtt_host` | `core-mosquitto` | Broker. Use the host's LAN address instead if you prefer. |
 | `mqtt_port` | `1883` | Broker port. |
 | `mqtt_user` / `mqtt_password` | *(empty)* | Leave empty for anonymous brokers. |
 | `discovery_prefix` | `homeassistant` | HA's MQTT discovery prefix. |
@@ -104,15 +104,18 @@ sampled four times a second rather than in bursts:
 
 ## Before you trust the audio
 
-The webcam microphone must actually be listening. On this installation the USB webcam mic source was sitting at **12% (-55 dB)** in PulseAudio, i.e. effectively muted,
-and no amount of fingerprinting will fix that:
+The webcam microphone must actually be listening. A USB webcam mic is usually turned
+right down in PulseAudio — one seen here was sitting at **12% (-55 dB)**, i.e. muted —
+and no amount of fingerprinting will fix that. List the sources and raise the one that
+is not a `.monitor`:
 
 ```bash
-pactl set-source-volume <usb-mic-source> 45%
+pactl list short sources
+pactl set-source-volume <source> 45%
 ```
 
-45% measured -24.7 dB mean / -8.1 dB peak on a record and matched within seconds; 70%
-clipped. Nothing else uses that mic (the go2rtc "Turntable" stream is video-only), so
+45% measured about -25 dB mean / -8 dB peak on a record and matched within seconds, while
+70% clipped. Nothing else uses that mic (the go2rtc "Turntable" stream is video-only), so
 the gain can stay where you put it.
 
 ## Install

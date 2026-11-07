@@ -7,7 +7,8 @@ See the [repository README](../README.md) for the full story, options and a Love
 card. The short version:
 
 1. Set the microphone gain so music is audible — e.g.
-   `pactl set-source-volume <usb-mic-source> 45%`.
+   `pactl set-source-volume <source> 45%`, with `<source>` from
+   `pactl list short sources` (skip the `.monitor` ones).
 2. Install the add-on, fill in `mqtt_user` / `mqtt_password`, start it.
 3. Watch the log: it prints the PulseAudio source it picked and every match.
 4. A new device **Vinyl Ear (&lt;device_name&gt;)** appears under *Settings → Devices &

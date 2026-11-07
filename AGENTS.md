@@ -22,21 +22,27 @@ repository.yaml            makes this repo an add-on repository
 
 ## The live installation this was built against
 
-- Home Assistant OS **2026.11.0** at `<ha-host>`, reachable over SSH as
-  `<ssh-user>@<ha-host>` with passwordless `sudo` (the Advanced SSH add-on; the `ha` CLI
-  is **not** authorised from there, but `docker` is).
+This repository is public, so host addresses, the SSH user, the microphone source name
+and the broker address are **not** in it. They live in `AGENTS.local.md` beside this file,
+which is gitignored — read that before touching the live installation. Everything below
+is architecture, not addresses.
+
+- Home Assistant OS **2026.11.0** on a home LAN, reached over SSH as the Advanced SSH
+  add-on's user with passwordless `sudo` (the `ha` CLI is **not** authorised from there,
+  but `docker` is).
 - Installed as a **local add-on** from `/addons/vinyl_ear` → container
   `app_local_vinyl_ear`. Editing this repo is not enough: the add-on must be
   **Rebuilt** from the Add-on page. Hacks inside the running container do not survive it.
-- Microphone: USB webcam mic, PulseAudio source
-  `<usb-mic-source>`. The go2rtc
-  "Turntable" stream is video-only (`/dev/video0`, mjpeg), so the mic is free.
+- Microphone: a USB webcam microphone; the model and its exact PulseAudio source are in
+  `AGENTS.local.md`. The go2rtc "Turntable" stream is video-only (`/dev/video0`, mjpeg),
+  so the mic is free.
 - Capture gain was 12 % (-55 dBFS) when this started, i.e. deaf; 45 % works. Set with
   `pactl set-source-volume <source> 45%` over `PULSE_SERVER=unix:/run/audio/pulse.sock`.
 - Room noise floor measured **-35 dBFS**; music measured about **-23 dBFS**. That is why
   a fixed -45 dBFS gate failed (see gotcha 6).
-- MQTT: Mosquitto add-on, broker `<ha-host>:1883`, user and password in the add-on
-  options (never in this repo). Topics live under `vinyl_ear/<device_name>/`.
+- MQTT: Mosquitto add-on, broker on the HA host (`AGENTS.local.md` has the address and
+  port), user and password in the add-on options (never in this repo). Topics live under
+  `vinyl_ear/<device_name>/`.
 - `device_name` (default `turntable`) drives the HA device, the entity ids
   (`sensor.vinyl_ear_<device_name>_now_playing`,
   `binary_sensor.vinyl_ear_<device_name>_audio_detected`), the topic prefix and the
@@ -53,7 +59,7 @@ when the user presses Done. Take a `lovelace.lovelace.bak-<timestamp>` copy ever
 
 Relevant cards on that installation:
 
-- View `Lounge Remote` (views[0]) → `vertical-stack` → **card 6** is the turntable
+- View `views[0]` (title in `AGENTS.local.md`) → `vertical-stack` → **card 6** is the turntable
   conditional: `vertical-stack [ markdown(details), horizontal-stack[ markdown(artwork),
   webrtc-camera(square) ] ]`, gated on `input_boolean.activity_turntable == on`.
 - View `Turntable` (path `turntable`): `type: panel`, one `custom:webrtc-camera` with a
@@ -132,12 +138,16 @@ the storage files under `/config/.storage` instead.
 1. Bump `VERSION` in `vinyl_ear/app/main.py` and `version:` in `vinyl_ear/config.yaml`.
 2. `python3 -m py_compile vinyl_ear/app/main.py` — there are no automated tests.
 3. `tar -czf - . | ssh <ssh-user>@<ha-host> 'sudo -n tar -xzf - -C /addons/vinyl_ear'` so
-   the local install matches the repo.
-4. Commit and push to https://github.com/matthamiltonnz/vinyl-ear.
+   the local install matches the repo (both values are in `AGENTS.local.md`).
+4. Commit and push to https://github.com/matthamiltonnz/vinyl-ear (public — check the
+   diff for anything installation specific first, see below).
 5. The user presses **Rebuild** on the add-on page; Lovelace changes land through an HA
    restart (see above).
 6. Remove scratch files from `/config` and `/tmp` — `/config` is their live Home
    Assistant configuration directory.
+7. Before pushing: `grep -rInE '([0-9]{1,3}\.){3}[0-9]{1,3}|@|alsa_input|ssh ' --exclude-dir=.git .`
+   should return only `<...>` placeholders. The repo is public, so host addresses, emails,
+   SSH users, mic source names and broker details must all stay in `AGENTS.local.md`.
 
 ## Known limitations
 
