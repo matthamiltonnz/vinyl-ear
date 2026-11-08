@@ -6,6 +6,10 @@ discovery — so `sensor.vinyl_ear_<device_name>_now_playing` carries the artist
 year and sleeve, and `binary_sensor.…_audio_detected` says whether the input is live. The same
 capture can be recorded losslessly, a side at a time, and served as a live radio stream.
 
+It has to hear the record anyway, so ripping and streaming came free: the same chunks that are
+fingerprinted are written to a FLAC or WAV file (optionally split at the side's track gaps) and,
+if you switch it on, offered as a radio URL that Music Assistant or any other player can use.
+
 ```
 mic/line ──▶ noise gate ──▶ 15 s clip ──▶ Shazam (shazamio) ──▶ MQTT discovery
 ```

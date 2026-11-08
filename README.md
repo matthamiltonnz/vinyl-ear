@@ -4,13 +4,19 @@ Home Assistant add-on that works out **what record is playing** on the turntable
 publishes it to Home Assistant over MQTT. Vinyl is analogue, so nothing reports track
 metadata — this listens to a microphone or any capture device connected to Home Assistant
 (a webcam mic in the room, or a line input fed by the turntable's own output), fingerprints
-the audio with Shazam, and fills in the gap. The same input can be recorded losslessly, a
-side at a time, for ripping.
+the audio with Shazam, and fills in the gap.
+
+It has to hear the record anyway, so the same capture does two more jobs: a side can be
+**recorded losslessly** — one file, or split at its track gaps — and the audio can be served
+as a **live radio stream** for Music Assistant or anything else that plays a URL.
+
 
 ```
 mic/line ──▶ noise gate ──▶ 15 s clip ──▶ Shazam (shazamio) ──▶ MQTT discovery
                                                                  ├─ sensor.turntable_now_playing
-                                                                 └─ binary_sensor.turntable_audio
+                                                                 └─ binary_sensor.turntable_audio_detected
+the same capture ──▶ rip ──▶ FLAC or WAV, a side at a time, split at its gaps
+                 └─▶ stream ──▶ MP3 or FLAC on :8098
 ```
 
 ## Why not an existing project?
