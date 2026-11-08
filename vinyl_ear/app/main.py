@@ -41,6 +41,9 @@ ALBUM_STORE = Path("/data/albums.json")
 # The rip options live in the web interface, so they need a home the add-on owns: the
 # add-on's own options are only written by the supervisor, and only at a restart.
 RIP_SETTINGS_FILE = Path("/data/rip-settings.json")
+# The manual listening switch, for installations with no `active_entity`. Off unless
+# it has been switched on, which is what the add-on means by "not listening".
+LISTENING_FILE = Path("/data/listening.json")
 RIP_SETTING_FIELDS = (
     "rip_dir",
     "rip_format",
@@ -52,7 +55,7 @@ RIP_SETTING_FIELDS = (
     "rip_auto_stop_seconds",
     "rip_split",
 )
-VERSION = "0.11.6"
+VERSION = "0.11.7"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -608,7 +611,8 @@ async def watch_active_entity(
     failures = 0
     while not stop.is_set():
         try:
-            flag["active"] = await supervised_entity_is_on(session, cfg.active_entity)
+            flag["entity"] = await supervised_entity_is_on(session, cfg.active_entity)
+            apply_gate(cfg, flag)
             failures = 0
         except GateUnavailable as err:
             log.error(
@@ -617,13 +621,15 @@ async def watch_active_entity(
                 cfg.active_entity,
                 err,
             )
-            flag["active"] = True
+            flag["entity"] = None
+            apply_gate(cfg, flag)
             return
         except Exception as err:  # noqa: BLE001 - fail open rather than stop listening
             failures += 1
             if failures == 1 or failures % 60 == 0:
                 log.warning("Active entity check failed (%s); assuming active", err)
-            flag["active"] = True
+            # Keep the last known answer: a failed poll must not flip the switch.
+            apply_gate(cfg, flag)
         await asyncio.sleep(ACTIVE_CHECK_SECONDS)
 
 
@@ -943,6 +949,34 @@ def note(status: dict[str, Any], text: str) -> None:
     events = status.setdefault("events", [])
     events.append((time.strftime("%H:%M:%S"), text[:160]))
     del events[:-40]
+
+
+def load_listening_state() -> bool:
+    """The manual listening switch; off when nothing has been saved yet."""
+    try:
+        saved = json.loads(LISTENING_FILE.read_text())
+    except (OSError, ValueError):
+        return False
+    return bool(saved.get("listening", False))
+
+
+def save_listening_state(listening: bool) -> None:
+    try:
+        LISTENING_FILE.write_text(json.dumps({"listening": listening}))
+    except OSError as err:
+        log.warning("Could not save %s (%s)", LISTENING_FILE, err)
+
+
+def apply_gate(cfg: Config, gate: dict[str, Any]) -> None:
+    """Decide whether to listen: the entity when there is one, else the web switch.
+
+    `gate["entity"]` stays None while nothing has been read from Home Assistant (no
+    `active_entity`, no `homeassistant_api`, or a failed poll), and None is what makes the
+    manual switch the authority - which is the fallback this add-on offers.
+    """
+    entity = gate.get("entity")
+    gate["active"] = bool(entity) if entity is not None else bool(gate.get("manual"))
+    gate["source"] = "entity" if entity is not None else "manual"
 
 
 def forget_task(task: asyncio.Task) -> None:
@@ -1629,7 +1663,13 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=240)
     tape: asyncio.Queue[bytes] = asyncio.Queue(maxsize=RIP_QUEUE_CHUNKS)
     commands: asyncio.Queue[str] = asyncio.Queue()
-    active = {"active": True}
+    active: dict[str, Any] = {
+        "entity": None,
+        "manual": load_listening_state(),
+        "active": False,
+        "source": "manual",
+    }
+    apply_gate(cfg, active)
     watcher = (
         asyncio.create_task(watch_active_entity(cfg, session, active))
         if cfg.active_entity
@@ -1678,6 +1718,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         "levels": [],
         "playing": False,
         "active": None,
+        "activity_source": "manual",
         "failures": 0,
         "last_lookup": None,
         "last_answer": None,
@@ -1705,7 +1746,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     ripper = asyncio.create_task(
         rip_worker(cfg, source, channels, tape, commands, client, status)
     )
-    server = asyncio.create_task(web_server(cfg, status, commands))
+    server = asyncio.create_task(web_server(cfg, status, commands, active))
     radio = (
         asyncio.create_task(stream_server(cfg, encoder, status))
         if encoder is not None
@@ -1818,13 +1859,17 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
             if status.get("active") is not active["active"]:
                 # The gate only spoke up once a track had been playing, which made a cold
-                # start with the activity switch off look like a dead add-on.
+                # start with the gate closed look like a dead add-on.
                 status["active"] = active["active"]
-                gate_state = "on — listening" if active["active"] else "off — not listening"
-                if cfg.active_entity:
-                    log.info("%s is %s", cfg.active_entity, gate_state)
-                    note(status, "%s is %s" % (cfg.active_entity, gate_state))
+                if active.get("source") == "entity":
+                    where = "%s is" % cfg.active_entity
+                else:
+                    where = "Listening (web switch) is"
+                state = "on — listening" if active["active"] else "off — not listening"
+                log.info("%s %s", where, state)
+                note(status, "%s %s" % (where, state))
 
+            status["activity_source"] = active.get("source", "manual")
             if not active["active"]:
                 if playing:
                     playing = False
@@ -2172,6 +2217,9 @@ INDEX_HTML = (
     <div class="row"><span>refused lookups</span><span id="failures">—</span></div>
     <div class="row"><span>last lookup</span><span id="lookup">—</span></div>
     <div class="row"><span>last answer</span><span id="answer">—</span></div>
+    <p class="buttons">
+      <button id="listenButton" class="quiet">Start listening</button>
+    </p>
   </section>
   <section>
     <h2>Rip</h2>
@@ -2278,9 +2326,21 @@ function renderMeter(status) {
   $("fill").style.width = pct(status.level) + "%";
   $("gateMark").style.left = pct(status.threshold) + "%";
   $("level").textContent = db(status.level);
-  $("activity").textContent = status.active === true
-    ? "on"
-    : (status.active === false ? "off — not listening" : "—");
+  const gateBy = status.activity_source === "entity"
+    ? (status.active_entity || "the activity entity")
+    : "web switch";
+  listeningOn = status.active === true;
+  $("activity").textContent = status.active === null || status.active === undefined
+    ? "—"
+    : (listeningOn ? "on — " + gateBy : "off — not listening (" + gateBy + ")");
+  const listenButton = $("listenButton");
+  if (status.active_entity) {
+    listenButton.disabled = true;
+    listenButton.textContent = "Controlled by " + status.active_entity;
+  } else {
+    listenButton.disabled = false;
+    listenButton.textContent = listeningOn ? "Stop listening" : "Start listening";
+  }
   $("gates").textContent = db(status.threshold) + " / " + db(status.floor);
   $("playing").textContent = status.playing ? "yes — filling a clip" : "no";
   $("playing").style.color = status.playing ? "#9ccc65" : "";
@@ -2361,6 +2421,7 @@ function renderRip(status) {
 
 let settingsDirty = false;
 let streamUrlText = "";
+let listeningOn = false;
 
 function renderSettings(settings) {
   if (!settings || settingsDirty) return;   // never stomp on what is being edited
@@ -2553,6 +2614,30 @@ $("streamCopy").onclick = async () => {
   setTimeout(() => { button.textContent = "Copy URL"; }, 1500);
 };
 
+// Only shown as a real switch when no activity entity is configured: with one, the entity
+// decides and the button is disabled.
+$("listenButton").onclick = async () => {
+  const button = $("listenButton");
+  const wanted = !listeningOn;
+  button.disabled = true;
+  try {
+    const response = await fetch("api/listening", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ listening: wanted }),
+    });
+    if (!response.ok) {
+      const answer = await response.json().catch(() => ({}));
+      button.textContent = answer.error || "could not change it";
+      return;
+    }
+  } catch (err) {
+    button.textContent = "could not change it";
+    return;
+  }
+  refresh();
+};
+
 refresh();
 setInterval(refresh, 1000);
 </script>
@@ -2599,7 +2684,10 @@ def rip_path(cfg: Config, name: str) -> Path | None:
 
 
 async def web_server(
-    cfg: Config, status: dict[str, Any], commands: "asyncio.Queue[str]"
+    cfg: Config,
+    status: dict[str, Any],
+    commands: "asyncio.Queue[str]",
+    gate: dict[str, Any] | None = None,
 ) -> None:
     """The UI behind Home Assistant ingress: what the listener hears, and the ripper."""
 
@@ -2626,6 +2714,7 @@ async def web_server(
         payload["rips"] = [item for item in rips if item["name"] != mid_rip]
         payload["rip_dir"] = cfg.rip_dir
         payload["settings"] = rip_settings(cfg)
+        payload["active_entity"] = cfg.active_entity
         # The chunk loop is the only writer of `holding`, but it only runs while audio
         # arrives: taking the on/off flags from it made the page say "off" after the
         # settings had been changed on a silent input.
@@ -2640,6 +2729,34 @@ async def web_server(
             round(time.time() - looked_up) if looked_up else None
         )
         return web.json_response(payload)
+
+    async def api_listening(request: web.Request) -> web.StreamResponse:
+        """The manual listening switch, for installations with no activity entity."""
+        if cfg.active_entity:
+            return web.json_response(
+                {"error": "%s decides this" % cfg.active_entity}, status=409
+            )
+        try:
+            body = await request.json()
+        except (ValueError, aiohttp.ContentTypeError):
+            body = None
+        if not isinstance(body, dict):
+            return web.json_response({"error": "send a JSON object"}, status=400)
+        wanted = body.get("listening")
+        if not isinstance(wanted, bool):
+            return web.json_response(
+                {"error": "listening must be true or false"}, status=400
+            )
+        if gate is None:
+            return web.json_response({"error": "no gate to change"}, status=500)
+        gate["manual"] = wanted
+        apply_gate(cfg, gate)
+        await asyncio.to_thread(save_listening_state, wanted)
+        log.info(
+            "Listening switched %s from the web UI", "on" if wanted else "off"
+        )
+        note(status, "Listening switched %s from the web UI" % ("on" if wanted else "off"))
+        return web.json_response({"ok": True, "listening": gate["active"]})
 
     async def api_rip(request: web.Request) -> web.StreamResponse:
         try:
@@ -2709,6 +2826,7 @@ async def web_server(
             web.get("/", index),
             web.get("/api/status", api_status),
             web.post("/api/rip", api_rip),
+            web.post("/api/listening", api_listening),
             web.patch("/api/settings", api_settings),
             web.get("/files/{name}", api_file),
             web.delete("/files/{name}", api_delete),

@@ -1,5 +1,5 @@
 name: Vinyl Ear
-version: "0.11.6"
+version: "0.11.7"
 slug: vinyl_ear
 description: Listens to a microphone or line input, identifies the record that is playing with Shazam, publishes it to Home Assistant over MQTT, and can record a side losslessly for ripping
 url: https://github.com/matthamiltonnz/vinyl-ear
@@ -24,7 +24,7 @@ panel_title: Vinyl Ear
 ports:
   8098/tcp: 8098
 ports_description:
-  8098/tcp: Live MP3 stream for Music Assistant
+  8098/tcp: Live audio stream (MP3 or FLAC)
 options:
   source: ""
   active_entity: ""

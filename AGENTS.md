@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.11.6**.
+what the startup banner prints). Current: **0.11.7**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -19,6 +19,8 @@ vinyl_ear/app/main.py      everything: capture, noise gate, Shazam, artwork cach
                            (aiohttp server + the page it serves, as one string) and the
                            radio stream (a second aiohttp server + one ffmpeg)
 vinyl_ear/run.sh           sets PULSE_SERVER to /run/audio/pulse.sock when present
+vinyl_ear/translations/en.yaml
+                           names and descriptions for the add-on's option form
 lovelace/*.yaml            card/view YAML that is pasted or patched into Lovelace
 repository.yaml            makes this repo an add-on repository
 ```
@@ -307,11 +309,16 @@ patch the storage file from those, do not hand-edit the JSON.
     chunk loop returns before it touches `status["level"]`, publishes nothing and logs nothing
     — the page showed `level —`, `playing no` and an idle rip panel, which is exactly what a
     stalled capture looked like too. It only ever said so (`"%s is off"`) from inside the
-    track-clearing branch, i.e. after a track had played. The loop now writes
-    `status["active"]` on every chunk that flips it, logs and notes the transition, and the
-    page has an `activity` row that reads "off — not listening". Check that row before
-    believing anything else on the page: `ticks: 1242` in the loop with `level: None` was this,
-    not a stall.
+    track-clearing branch, i.e. after a track had played. The gate is now a dict with two
+    inputs — `apply_gate()` makes the entity win when its state is known and the **manual web
+    switch** (`LISTENING_FILE`, `/data/listening.json`, off by default when absent) the
+    authority when it is not, which is why an unreadable entity (`homeassistant_api` missing)
+    falls back to the switch instead of a hard-coded True — and a failed poll keeps the last
+    known answer rather than flipping the switch. The loop writes `status["active"]`, logs and
+    notes the transition, and the page has an `activity` row naming the authority plus a
+    Listening button (`POST /api/listening`, 409 when an entity owns it). Check that row
+    before believing anything else on the page: `ticks: 1242` in the loop with `level: None`
+    was this, not a stall.
 
 ## Ripping
 

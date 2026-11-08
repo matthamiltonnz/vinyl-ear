@@ -1,0 +1,76 @@
+configuration:
+  source:
+    name: Capture source
+    description: >-
+      PulseAudio source to listen to, for example the line input of a USB interface. Leave
+      it empty to use the first non-monitor source, which is only dependable with a single
+      capture device attached.
+  active_entity:
+    name: Activity switch (optional)
+    description: >-
+      Optional input_boolean that switches detection on and off, so the add-on only listens
+      while the turntable is in use. Leave it empty to use the Listening switch in the
+      add-on's own web interface instead - that switch starts off and is remembered.
+  sample_rate:
+    name: Sample rate
+    description: Capture rate in Hz. 44100 or 48000 match a record; 16000 is smaller and noisier.
+  listen_seconds:
+    name: Clip length (seconds)
+    description: How much audio is gathered for each Shazam lookup.
+  silence_clear_seconds:
+    name: Clear after silence (seconds)
+    description: >-
+      How long the input must be quiet before the published track is cleared. Kept separate
+      from the clip length so a track is not dropped between two songs on a side.
+  keep_first_album:
+    name: Keep the first album name
+    description: Keep the first album Shazam answers with instead of switching per track.
+  blank_unknown_track:
+    name: Blank the title when Shazam does not know it
+    description: >-
+      Publish the artist and sleeve but an empty title for a record Shazam cannot name,
+      instead of holding the previous title.
+  noise_gate_db:
+    name: Noise gate (dBFS)
+    description: >-
+      Starting threshold for "audio is playing". The listener learns the room's own floor
+      from the quiet between records and moves the gate from there.
+  poll_seconds:
+    name: Minimum seconds between lookups
+    description: Back-off for Shazam once a track has been named.
+  device_name:
+    name: Device name
+    description: >-
+      Drives the Home Assistant device, the entity ids, the MQTT topics and the artwork
+      filenames. Lower case letters, digits and underscores.
+  mqtt_host:
+    name: MQTT broker
+    description: Host of the broker, e.g. the Mosquitto add-on.
+  mqtt_port:
+    name: MQTT port
+    description: Usually 1883.
+  mqtt_user:
+    name: MQTT user
+    description: Leave empty for an anonymous broker.
+  mqtt_password:
+    name: MQTT password
+    description: Leave empty for an anonymous broker.
+  discovery_prefix:
+    name: Discovery prefix
+    description: Prefix for Home Assistant MQTT discovery, normally `homeassistant`.
+  log_level:
+    name: Log level
+    description: How much detail goes to the add-on log.
+  stream_enabled:
+    name: Radio stream
+    description: >-
+      Serve the capture as a live audio stream on port 8098, for Music Assistant or anything
+      else that takes a radio URL. Off by default because it is unauthenticated live audio.
+  stream_bitrate:
+    name: Stream bitrate
+    description: MP3 bitrate in kbit/s. Ignored when the format is FLAC.
+  stream_format:
+    name: Stream format
+    description: MP3 is the most widely understood; FLAC is lossless.
+network:
+  8098/tcp: Live audio stream (MP3 or FLAC)

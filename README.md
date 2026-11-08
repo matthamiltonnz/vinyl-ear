@@ -140,7 +140,10 @@ sampled four times a second rather than in bursts:
   `blank_unknown_track: false` to hold the last recognised title instead.
 - **Silence clears the state** after `silence_clear_seconds` — see
   [What it publishes](#what-it-publishes).
-- **`active_entity`**, when set, pauses all of the above unless that entity is `on`.
+- **`active_entity`** (optional), when set, pauses all of the above unless that entity is `on`
+  — the listener's own on/off switch, so the add-on only works while the turntable is in use.
+  Leave it empty and the web interface grows a **Listening** switch instead, off until you
+  turn it on. Either way the row on the page says which one is deciding.
 - **The activity threshold adapts to the room, without eating the music.**
   `noise_gate_db` is only a floor: the listener learns the room's own noise level and sits
   6 dB above it, so a fridge, fan or amplifier hiss that is above the fixed gate stops
@@ -169,7 +172,7 @@ sampled four times a second rather than in bursts:
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `source` | *(auto)* | PulseAudio source name, e.g. the line input of a USB interface. Empty picks the first non-monitor input; set it explicitly once a second capture device is plugged in, because the order is not guaranteed. |
-| `active_entity` | *(none)* | Listen only while this entity is `on`, e.g. `input_boolean.activity_turntable`. Empty means always listen. Read through the supervisor's Home Assistant API; if it cannot be read the add-on keeps listening. |
+| `active_entity` | *(none)* | Optional `input_boolean` that switches detection on and off, e.g. `input_boolean.activity_turntable`. Empty means the web interface's **Listening** switch decides instead (off until turned on). Read through the supervisor's Home Assistant API; if it cannot be read at all the manual switch takes over. |
 | `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
 | `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
 | `keep_first_album` | `true` | A song can appear on several releases, and Shazam answers with whichever one its catalogue prefers — so the album can jump between lookups. Remember the album a song was first matched with (in `/data/albums.json`) and keep using it. Set `false` to always take Shazam's latest answer. |
@@ -320,6 +323,9 @@ installation.
   a ~30 s level history (green once a chunk is above the gate), the gate and the measured
   room floor, whether audio is above the gate, how many lookups Shazam has refused, how long
   ago the last lookup was and what it answered.
+- **Listening** — the button that switches detection on and off when no `active_entity` is
+  configured. With an entity configured it is disabled and names the entity instead, and the
+  `activity` row above it always says which of the two is deciding.
 - **Rip** — state, elapsed time, peak level and the file being written, whether auto start and auto stop
   are on (and holding after a hand stop), what the last gain calibration did, a Start/Stop
   button and a **Set the gain** button that do exactly what the MQTT switch does, and the
