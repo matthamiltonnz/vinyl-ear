@@ -1,20 +1,21 @@
 # Working notes for this repo (agent memory)
 
 Home Assistant add-on: identifies the record playing on a turntable by listening to a
-room microphone, asking Shazam, and publishing the result over MQTT with Home Assistant
-discovery. Python 3, `shazamio` for Shazam, `paho-mqtt` for publishing, ffmpeg for
-decoding; no framework, no tests directory.
+microphone or a line input, asking Shazam, and publishing the result over MQTT with Home
+Assistant discovery. The same capture can be recorded - stereo, 16-bit, 44.1/48 kHz, FLAC
+or WAV - a side at a time, for ripping. Python 3, `shazamio` for Shazam, `paho-mqtt` for
+publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests directory.
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.6.6**.
+what the startup banner prints). Current: **0.7.0**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
-                           map: config:rw, options + schema
+                           map: config:rw + share:rw (rips), options + schema
 vinyl_ear/Dockerfile       python:3.11-slim + ffmpeg + pulseaudio-utils
 vinyl_ear/app/main.py      everything: capture, noise gate, Shazam, artwork cache,
-                           MQTT discovery, run loop
+                           MQTT discovery, rip recorder, run loop
 vinyl_ear/run.sh           sets PULSE_SERVER to /run/audio/pulse.sock when present
 lovelace/*.yaml            card/view YAML that is pasted or patched into Lovelace
 repository.yaml            makes this repo an add-on repository
@@ -36,6 +37,10 @@ is architecture, not addresses.
 - Microphone: a USB webcam microphone; the model and its exact PulseAudio source are in
   `AGENTS.local.md`. The go2rtc "Turntable" stream is video-only (`/dev/video0`, mjpeg),
   so the mic is free.
+- A line input is being added (Behringer UCA202/UCA222: line level, 16-bit, 44.1/48 kHz,
+  stereo) so the listener hears the record rather than the room and so sides can be
+  ripped. Its source name goes in `AGENTS.local.md` and in the add-on's `source` option -
+  with two capture devices the auto-pick is not deterministic.
 - Capture gain was 12 % (-55 dBFS) when this started, i.e. deaf; 45 % works. Set with
   `pactl set-source-volume <source> 45%` over `PULSE_SERVER=unix:/run/audio/pulse.sock`.
 - Room noise floor measured **-35 dBFS**; music measured about **-23 dBFS**. That is why
@@ -180,6 +185,31 @@ patch the storage file from those, do not hand-edit the JSON.
 
   `/local/vinyl-art/<device_name>.jpg?v=<epoch>`; the untouched CDN URL is kept in
   `artwork_remote`. Needs `map: config:rw`.
+9. **A second `parec` on the same USB source can come back as digital silence.** Measured
+   here: with the add-on already reading the USB webcam's source, a second `parec` on it
+   returned 12 s of exact zeros (peak -270 dBFS) while the first stream was hearing music.
+   That is why the rip is not a second reader: `audio_reader()` takes a `tap` callback and
+   the same chunks go to `rip_worker()`, so recording and Shazam share one capture. It also
+   means the rip cannot drift out of step with what the listener hears, and there is no
+   "which stream is the real one" question when a line input is added.
+10. **A line input needs a phono preamp, and the channel count must come from `pactl`.**
+   The UCA202/UCA222 (and any USB class-compliant interface) is line level, 16-bit,
+   44.1/48 kHz stereo — it is not a phono stage, so the turntable must arrive with RIAA
+   equalisation already applied. `source_channels()` reads the `s16le 2ch` column of
+   `pactl list short sources`; asking `parec` for `--channels=2` on a mono source gets a
+   duplicated mono channel, and asking for mono on a stereo one throws half the signal
+   away, so the count is discovered rather than assumed. With two capture devices plugged
+   in, `source` must be set explicitly: "the first non-monitor source" is not stable.
+
+## Ripping
+
+`RipRecorder` + `rip_worker()` write WAV as the chunks arrive (a `wave` handle, patched on
+close) and encode to FLAC with ffmpeg at stop, deleting the WAV on success and keeping it
+with a warning when the encode fails — a failed encode must never lose the side. Rip state
+lives on `vinyl_ear/<device>/rip` (progress JSON) and `.../rip/state` (`ON`/`OFF`, retained),
+and the switch entity drives `.../rip/set`. `rip_max_minutes` bounds a forgotten switch.
+Files land in `rip_dir`, `/share/vinyl-rips` by default, which is why the manifest now maps
+`share:rw`.
 
 ## Testing without a turntable
 
@@ -194,6 +224,16 @@ sudo docker exec app_local_vinyl_ear python /tmp/test.py
 When importing a module by path, register it in `sys.modules` **before**
 `spec.loader.exec_module()`, otherwise `@dataclasses.dataclass` fails resolving
 annotations.
+
+The rip is easy to test the same way and worth testing, because it touches the filesystem:
+point `rip_dir` at `/tmp/…`, call `RipRecorder.start()`/`write()`/`finish()` with synthetic
+stereo chunks, and check the result with `ffprobe -show_entries
+stream=codec_name,channels,sample_rate:format=duration` — a 4 s stereo sine comes out as
+`pcm_s16le 44100 2ch 4.000000` for WAV and `flac 44100 2ch 4.000000` for FLAC. To exercise
+the MQTT end of it, drive `rip_worker()` with a tape queue and a command queue directly, or
+go through `run()` with a fake client that records `on_message` and call
+`client.on_message(None, None, Message("ON"))` — that covers thread-safe hand-off, the
+worker, the encode and the published state.
 
 For the state machine, monkeypatch `audio_reader` (push synthetic chunks paced at
 `CHUNK_SECONDS`), `recognise`, `cache_artwork` and `publish_discovery`, then run

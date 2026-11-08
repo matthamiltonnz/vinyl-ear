@@ -1,7 +1,7 @@
 name: Vinyl Ear
-version: "0.6.6"
+version: "0.7.0"
 slug: vinyl_ear
-description: Listens to a room microphone, identifies the record that is playing with Shazam, and publishes it to Home Assistant over MQTT
+description: Listens to a microphone or line input, identifies the record that is playing with Shazam, publishes it to Home Assistant over MQTT, and can record a side losslessly for ripping
 url: https://github.com/matthamiltonnz/vinyl-ear
 arch:
   - amd64
@@ -10,6 +10,8 @@ audio: true
 homeassistant_api: true
 map:
   - config:rw
+  - share:rw
+  - media:rw
 startup: application
 boot: auto
 init: false
@@ -30,6 +32,9 @@ options:
   mqtt_password: ""
   discovery_prefix: homeassistant
   log_level: info
+  rip_dir: /share/vinyl-rips
+  rip_format: flac
+  rip_max_minutes: 30
 schema:
   source: str?
   active_entity: str?
@@ -47,3 +52,6 @@ schema:
   mqtt_password: password?
   discovery_prefix: str
   log_level: list(debug|info|warning|error)
+  rip_dir: str
+  rip_format: list(wav|flac)
+  rip_max_minutes: int(1,180)

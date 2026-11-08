@@ -2,8 +2,9 @@
 
 Home Assistant add-on that works out **what record is playing** on the turntable and
 publishes it to Home Assistant over MQTT. Vinyl is analogue, so nothing reports track
-metadata — this listens to a room microphone, fingerprints the audio with Shazam, and
-fills in the gap.
+metadata — this listens to a room microphone or a line input, fingerprints the audio with
+Shazam, and fills in the gap. The same input can be recorded losslessly, a side at a time,
+for ripping.
 
 ```
 room mic ──▶ noise gate ──▶ 15 s clip ──▶ Shazam (shazamio) ──▶ MQTT discovery
@@ -35,12 +36,15 @@ Assistant hands to add-ons with `audio: true` — the same path that `parec` and
 | --- | --- | --- |
 | `sensor.vinyl_ear_<device_name>_now_playing` | `Artist - Title`; `Artist - Album` while a record plays but the track is not recognised (`unknown_track: true`, no title); empty between records, because a name for a record that is not there is worse than no name | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `unknown_track`, `url`, `source`, `identified_at` |
 | `binary_sensor.vinyl_ear_<device_name>_audio_detected` | `ON` while the room is above the noise gate | — |
+| `switch.vinyl_ear_<device_name>_rip` | `ON` while a rip is recording | `file`, `seconds`, `peak_dbfs`, `clipped`, `channels`, `sample_rate`, `format` |
 
 `<device_name>` is the add-on option of the same name (`turntable` by default), and it
 also names the MQTT topics under `vinyl_ear/<device_name>/`. Entity ids follow the HA
 device name, so they carry the `vinyl_ear_` prefix; rename them in the UI if you want
 `sensor.turntable_now_playing`. Everything appears under one HA device named
-`Vinyl Ear (<device_name>)`, created by MQTT discovery — no YAML required.
+`Vinyl Ear (<device_name>)`, created by MQTT discovery — no YAML required. The rip is
+driven over `vinyl_ear/<device_name>/rip/set` (`ON`/`OFF`), with its state on
+`.../rip/state` and its progress on `.../rip`.
 
 Album artwork is downloaded to `/config/www/vinyl-art/<device_name>-<epoch>.jpg` (the
 fixed `<device_name>.jpg` is refreshed alongside it) and the `artwork` attribute points at
@@ -164,7 +168,7 @@ sampled four times a second rather than in bursts:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `source` | *(auto)* | PulseAudio source name. Empty picks the first non-monitor input. |
+| `source` | *(auto)* | PulseAudio source name, e.g. the line input of a USB interface. Empty picks the first non-monitor input; set it explicitly once a second capture device is plugged in, because the order is not guaranteed. |
 | `active_entity` | *(none)* | Listen only while this entity is `on`, e.g. `input_boolean.activity_turntable`. Empty means always listen. Read through the supervisor's Home Assistant API; if it cannot be read the add-on keeps listening. |
 | `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
 | `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
@@ -179,6 +183,45 @@ sampled four times a second rather than in bursts:
 | `mqtt_user` / `mqtt_password` | *(empty)* | Leave empty for anonymous brokers. |
 | `discovery_prefix` | `homeassistant` | HA's MQTT discovery prefix. |
 | `log_level` | `info` | `debug` logs every capture attempt and the audio level. |
+| `rip_dir` | `/share/vinyl-rips` | Where a rip is written. `/share`, `/media` and `/config` are all writable from the add-on; `/media/vinyl-rips` also shows up in Home Assistant's Media browser. |
+| `rip_format` | `flac` | `flac` (lossless, about a third of the size) or `wav` (uncompressed). Both keep exactly what the input delivered. |
+| `rip_max_minutes` | `30` | A rip stops itself after this long, so a forgotten switch cannot fill the disk. A 12" side is 20-25 minutes. |
+
+## Ripping a record
+
+Switch on the **Rip record** switch (MQTT discovery creates `switch.<device>_rip`) and drop
+the needle; switch it off when the side ends. The listener keeps running while it records —
+it is the same audio — so names keep appearing in the dashboard as the side plays. The
+finished file is `/share/vinyl-rips/<device_name>-<YYYYmmdd-HHMMSS>.flac`, and the switch's
+attributes carry the file, the elapsed seconds and the peak level.
+
+Some things decide whether the result is worth keeping:
+
+- **Line input, not a microphone.** A USB interface such as a Behringer UCA202/UCA222 is a
+  line-level, 16-bit, 44.1/48 kHz stereo input: set the `source` option to its PulseAudio
+  source (the add-on logs the name at startup, or run `pactl list short sources` in the
+  add-on's terminal). A microphone gives a mono room recording, and the add-on warns when
+  it is about to rip a mono source.
+- **The turntable needs a phono preamp** between it and the interface — RCA line level
+  with RIAA equalisation. A moving-magnet deck plugged straight in sounds thin, quiet and
+  noisy; a deck with a built-in preamp, or a separate phono stage, is what the interface
+  expects.
+- **Set the level once.** Play a loud passage and watch the `peak_dbfs` attribute: aim for
+  about -6 dBFS, never 0. The add-on reports `clipped: true` and warns when a sample hits
+  full scale — vinyl clicks make that easy, so keep a few dB of headroom. Trim with
+  `pactl set-source-volume <source> 100%` (or lower).
+- **Lossless here means "not compressed", not "more than 16 bits".** The capture is 16-bit
+  PCM at 44.1 kHz because that is what these interfaces deliver; FLAC stores it exactly,
+  WAV stores it unpacked. Keep `sample_rate` at `44100` for rips — 48 kHz would resample
+  CD-era material for nothing.
+- **One file per side, not per track.** The add-on records faithfully and does not guess
+  where the band stopped playing. Split a side afterwards with the ffmpeg already in the
+  image:
+
+  ```bash
+  ffmpeg -i side-a.flac -af silencedetect=noise=-40dB:d=1 -f null -  # where the gaps are
+  ffmpeg -i side-a.flac -ss 0 -to 212 -c copy track-01.flac          # then cut them out
+  ```
 
 ## Lovelace card
 

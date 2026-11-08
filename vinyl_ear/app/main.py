@@ -25,7 +25,7 @@ import threading
 import time
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 import paho.mqtt.client as mqtt
@@ -36,7 +36,7 @@ ARTWORK_DIR = Path("/config/www/vinyl-art")
 # How many epoch-named covers to keep beside the fixed `device_name.jpg`.
 ARTWORK_KEEP = 5
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.6.6"
+VERSION = "0.7.0"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -69,6 +69,11 @@ TRACK_CONFIRM_SECONDS = 180.0
 TRACK_CONFIRM_LOOKBACK = 4
 MAX_COOLDOWN_SECONDS = 300.0
 HEARTBEAT_SECONDS = 300.0
+# How often a running rip publishes its elapsed time and peak level.
+RIP_REPORT_SECONDS = 10.0
+# Chunks buffered between the capture and the rip writer: 2 s of audio, enough to cover a
+# slow disk or a FLAC encode without stalling the listener for long.
+RIP_QUEUE_CHUNKS = 8
 
 log = logging.getLogger("vinyl_ear")
 stop = threading.Event()
@@ -100,10 +105,12 @@ class Config:
     mqtt_password: str
     discovery_prefix: str
     log_level: str
+    rip_dir: str
+    rip_format: str
+    rip_max_minutes: int
 
-    @property
-    def bytes_per_second(self) -> int:
-        return self.sample_rate * 2  # mono, signed 16-bit little endian
+    def bytes_per_second(self, channels: int = 1) -> int:
+        return self.sample_rate * 2 * channels  # signed 16-bit little endian
 
     @property
     def base_topic(self) -> str:
@@ -131,6 +138,9 @@ def load_config() -> Config:
         mqtt_password=str(raw.get("mqtt_password") or ""),
         discovery_prefix=str(raw.get("discovery_prefix", "homeassistant")).strip("/"),
         log_level=str(raw.get("log_level", "info")),
+        rip_dir=str(raw.get("rip_dir") or "/share/vinyl-rips").strip(),
+        rip_format=str(raw.get("rip_format") or "flac").strip().lower(),
+        rip_max_minutes=int(raw.get("rip_max_minutes", 30)),
     )
 
 
@@ -193,10 +203,8 @@ def calibrate_threshold(
     return floor, wanted
 
 
-def find_source(cfg: Config) -> str:
-    """Return the PulseAudio source to record from."""
-    if cfg.source:
-        return cfg.source
+def list_sources() -> list[tuple[str, int]]:
+    """PulseAudio capture sources as (name, channels); output monitors are skipped."""
     if shutil.which("pactl") is None:
         raise CaptureError("pactl not found; set the 'source' option explicitly")
     result = subprocess.run(
@@ -208,26 +216,61 @@ def find_source(cfg: Config) -> str:
     )
     if result.returncode != 0:
         raise CaptureError(f"pactl failed: {result.stderr.strip() or 'unknown error'}")
-    sources = [
-        line.split("\t")[1] for line in result.stdout.splitlines() if len(line.split("\t")) >= 2
-    ]
-    for name in sources:
-        if ".monitor" not in name:
-            log.info("Using PulseAudio source %s", name)
-            return name
-    raise CaptureError(
-        "no capture source found; available sources: "
-        + (", ".join(sources) if sources else "none")
-    )
+    found: list[tuple[str, int]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2:
+            continue
+        name = fields[1]
+        if ".monitor" in name:
+            continue
+        channels = 1
+        # The spec column reads like "s16le 2ch 44100Hz" - sometimes without the rate.
+        for token in " ".join(fields[2:]).split():
+            if token.endswith("ch") and token[:-2].isdigit():
+                channels = int(token[:-2])
+        found.append((name, channels))
+    return found
 
 
-def parec_command(cfg: Config, source: str) -> list[str]:
+def find_source(cfg: Config) -> str:
+    """Return the PulseAudio source to record from."""
+    sources = list_sources()
+    names = [name for name, _ in sources]
+    if cfg.source:
+        if cfg.source in names:
+            return cfg.source
+        raise CaptureError(
+            f"configured source {cfg.source!r} is not available; capture sources are: "
+            + (", ".join(names) if names else "none")
+        )
+    if not names:
+        raise CaptureError("no capture source found; is the line input plugged in?")
+    log.info("Using PulseAudio source %s (capture sources: %s)", names[0], ", ".join(names))
+    return names[0]
+
+
+def source_channels(source: str) -> int:
+    """Channel count the source reports, so a stereo line input is not mixed down."""
+    try:
+        sources = list_sources()
+    except CaptureError as err:
+        log.warning("Could not read the channel count (%s); assuming mono", err)
+        return 1
+    for name, channels in sources:
+        if name == source:
+            return channels
+    log.warning("Source %s is not in the capture list; assuming mono", source)
+    return 1
+
+
+def parec_command(cfg: Config, source: str, channels: int = 1) -> list[str]:
     return [
         "parec",
         f"--device={source}",
         "--format=s16le",
         f"--rate={cfg.sample_rate}",
-        "--channels=1",
+        f"--channels={channels}",
         "--latency-msec=200",
         "--raw",
     ]
@@ -243,9 +286,20 @@ def chunk_level(data: bytes) -> float:
     return rms_to_dbfs(rms)
 
 
-async def audio_reader(cfg: Config, source: str, queue: "asyncio.Queue[bytes]") -> None:
-    """Stream capture chunks into the queue for as long as the add-on runs."""
-    command = parec_command(cfg, source)
+async def audio_reader(
+    cfg: Config,
+    source: str,
+    queue: "asyncio.Queue[bytes]",
+    channels: int = 1,
+    tap: Callable[[bytes], Awaitable[None]] | None = None,
+) -> None:
+    """Stream capture chunks into the queue for as long as the add-on runs.
+
+    `tap` sees every chunk as well - that is how a rip records the same audio the listener
+    hears, from a single `parec`, because a second reader on the same USB device cannot be
+    relied on to return sound.
+    """
+    command = parec_command(cfg, source, channels)
     log.debug("Starting capture: %s", " ".join(command))
     proc = subprocess.Popen(
         command,
@@ -254,7 +308,7 @@ async def audio_reader(cfg: Config, source: str, queue: "asyncio.Queue[bytes]") 
         bufsize=0,
     )
     assert proc.stdout is not None
-    chunk_bytes = int(cfg.sample_rate * 2 * CHUNK_SECONDS)
+    chunk_bytes = int(cfg.sample_rate * 2 * channels * CHUNK_SECONDS)
     try:
         while not stop.is_set():
             data = await asyncio.to_thread(proc.stdout.read, chunk_bytes)
@@ -265,7 +319,10 @@ async def audio_reader(cfg: Config, source: str, queue: "asyncio.Queue[bytes]") 
                 raise CaptureError(
                     "capture stream ended: " + stderr.decode("utf-8", "replace").strip()
                 )
-            await queue.put(data[: len(data) - (len(data) % 2)])
+            chunk = data[: len(data) - (len(data) % 2)]
+            await queue.put(chunk)
+            if tap is not None:
+                await tap(chunk)
     finally:
         proc.terminate()
         try:
@@ -319,13 +376,13 @@ async def watch_active_entity(
         await asyncio.sleep(ACTIVE_CHECK_SECONDS)
 
 
-def write_wav(pcm: bytes, sample_rate: int) -> str:
-    """Write raw s16le mono PCM to a temporary WAV file for shazamio."""
+def write_wav(pcm: bytes, sample_rate: int, channels: int = 1) -> str:
+    """Write raw s16le PCM to a temporary WAV file for shazamio."""
     handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     path = handle.name
     handle.close()
     with wave.open(path, "wb") as wav:
-        wav.setnchannels(1)
+        wav.setnchannels(channels)
         wav.setsampwidth(2)
         wav.setframerate(sample_rate)
         wav.writeframes(pcm)
@@ -565,6 +622,7 @@ def publish_discovery(client: mqtt.Client, cfg: Config) -> None:
     state_topic = f"{cfg.base_topic}/state"
     sensor_topic = f"{prefix}/sensor/vinyl_ear_{cfg.device_name}/now_playing/config"
     binary_topic = f"{prefix}/binary_sensor/vinyl_ear_{cfg.device_name}/audio/config"
+    switch_topic = f"{prefix}/switch/vinyl_ear_{cfg.device_name}/rip/config"
     # `has_entity_name` is on by default for MQTT discovery when a device is set, so the
     # entity ids come out as sensor.<device>_now_playing / binary_sensor.<device>_audio_detected.
     sensor = {
@@ -588,17 +646,33 @@ def publish_discovery(client: mqtt.Client, cfg: Config) -> None:
         "icon": "mdi:music-note",
         "device": device_block(cfg),
     }
+    switch = {
+        "name": "Rip record",
+        "has_entity_name": True,
+        "unique_id": f"vinyl_ear_{cfg.device_name}_rip",
+        "state_topic": f"{cfg.base_topic}/rip/state",
+        "command_topic": f"{cfg.base_topic}/rip/set",
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "json_attributes_topic": f"{cfg.base_topic}/rip",
+        "availability_topic": f"{cfg.base_topic}/availability",
+        "icon": "mdi:album",
+        "device": device_block(cfg),
+    }
     publish(client, sensor_topic, json.dumps(sensor))
     publish(client, binary_topic, json.dumps(binary))
+    publish(client, switch_topic, json.dumps(switch))
     log.info(
-        "Published MQTT discovery for device 'Vinyl Ear (%s)' — now_playing + audio_detected",
+        "Published MQTT discovery for device 'Vinyl Ear (%s)' — now_playing + audio_detected + rip",
         cfg.device_name,
     )
 
 
-async def recognise(shazam: Shazam, cfg: Config, clip: bytes) -> dict[str, Any] | None:
+async def recognise(
+    shazam: Shazam, cfg: Config, clip: bytes, channels: int = 1
+) -> dict[str, Any] | None:
     """Ask Shazam what the clip contains."""
-    path = write_wav(clip, cfg.sample_rate)
+    path = write_wav(clip, cfg.sample_rate, channels)
     recognise_fn = getattr(shazam, "recognize", None) or getattr(shazam, "recognize_song")
     try:
         response = await recognise_fn(path)
@@ -613,18 +687,222 @@ async def recognise(shazam: Shazam, cfg: Config, clip: bytes) -> dict[str, Any] 
     return parse_track(response or {}, cfg.device_name)
 
 
+class RipRecorder:
+    """Capture every chunk to disk, in the source's own channel count and rate.
+
+    The tape is the same audio the listener hears - one `parec`, no second reader - so a
+    rip and Shazam can run at once. WAV is written as it goes; `finish()` closes it and,
+    when `rip_format` is flac, encodes it losslessly with the ffmpeg already in the image.
+    """
+
+    def __init__(self, cfg: Config, channels: int) -> None:
+        self.cfg = cfg
+        self.channels = channels
+        self.recording = False
+        self.frames = 0
+        self.peak = 0
+        self.file: Path | None = None
+        self.wav_path: Path | None = None
+        self._wav: "wave.Wave_write | None" = None
+
+    @property
+    def seconds(self) -> float:
+        return self.frames / float(self.cfg.sample_rate)
+
+    @property
+    def peak_dbfs(self) -> float:
+        return rms_to_dbfs(self.peak)
+
+    def start(self) -> None:
+        directory = Path(self.cfg.rip_dir).expanduser()
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self.wav_path = directory / f"{self.cfg.device_name}-{stamp}.wav"
+        handle = wave.open(str(self.wav_path), "wb")
+        handle.setnchannels(self.channels)
+        handle.setsampwidth(2)
+        handle.setframerate(self.cfg.sample_rate)
+        self._wav = handle
+        self.recording = True
+        self.frames = 0
+        self.peak = 0
+
+    def write(self, data: bytes) -> None:
+        if self._wav is None:
+            return
+        try:
+            self._wav.writeframes(data)
+        except OSError as err:
+            log.error("Rip write failed (%s); closing the file", err)
+            self.finish()
+            return
+        self.frames += len(data) // (2 * self.channels)
+        samples = array.array("h")
+        samples.frombytes(data[: len(data) - (len(data) % 2)])
+        if samples:
+            level = max(max(samples), -min(samples))
+            if level > self.peak:
+                self.peak = level
+
+    def finish(self) -> Path | None:
+        """Close the file, encode to FLAC when configured, and return what was kept."""
+        handle, source = self._wav, self.wav_path
+        self._wav = None
+        self.recording = False
+        if handle is None or source is None:
+            return None
+        handle.close()
+        self.file = source
+        if self.cfg.rip_format == "flac":
+            target = source.with_suffix(".flac")
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(source),
+                    "-c:a",
+                    "flac",
+                    "-sample_fmt",
+                    "s16",
+                    str(target),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            if result.returncode == 0 and target.exists():
+                try:
+                    source.unlink()
+                except OSError:
+                    pass
+                self.file = target
+            else:
+                log.warning(
+                    "Could not encode %s to FLAC (%s); keeping the WAV",
+                    source.name,
+                    (result.stderr or "").strip()[:200],
+                )
+        return self.file
+
+
+async def rip_worker(
+    cfg: Config,
+    channels: int,
+    tape: "asyncio.Queue[bytes]",
+    commands: "asyncio.Queue[str]",
+    client: mqtt.Client,
+) -> None:
+    """Record while a rip is running, on MQTT commands; ignore the tape in between."""
+    state_topic = f"{cfg.base_topic}/rip/state"
+    info_topic = f"{cfg.base_topic}/rip"
+    recorder = RipRecorder(cfg, channels)
+    last_report = 0.0
+
+    def report(retain: bool = False) -> None:
+        publish(client, state_topic, "ON" if recorder.recording else "OFF", retain=retain)
+        publish(
+            client,
+            info_topic,
+            json.dumps(
+                {
+                    "state": "recording" if recorder.recording else "idle",
+                    "file": str(recorder.file) if recorder.file else "",
+                    "seconds": round(recorder.seconds),
+                    "peak_dbfs": round(recorder.peak_dbfs) if recorder.peak else -120,
+                    "clipped": recorder.peak >= 32767,
+                    "channels": channels,
+                    "sample_rate": cfg.sample_rate,
+                    "format": cfg.rip_format,
+                }
+            ),
+            retain=retain,
+        )
+
+    def stop_rip() -> None:
+        seconds = recorder.seconds
+        peak = recorder.peak_dbfs
+        clipped = recorder.peak >= 32767
+        path = recorder.finish()
+        report(retain=True)
+        if path is None:
+            log.info("Rip stopped before anything was written")
+            return
+        log.info(
+            "Rip finished: %s (%.0fs, peak %.0f dBFS%s)",
+            path,
+            seconds,
+            peak,
+            ", CLIPPED - lower the capture gain" if clipped else "",
+        )
+
+    report(retain=True)
+    try:
+        while not stop.is_set():
+            try:
+                while not commands.empty():
+                    command = commands.get_nowait().strip().upper()
+                    if command in {"START", "ON"} and not recorder.recording:
+                        try:
+                            recorder.start()
+                        except OSError as err:
+                            log.error("Cannot write a rip to %s (%s)", cfg.rip_dir, err)
+                            report(retain=True)
+                        else:
+                            last_report = 0.0
+                            report(retain=True)
+                            log.info(
+                                "Ripping to %s (%d ch, %d Hz, %s)",
+                                recorder.wav_path,
+                                channels,
+                                cfg.sample_rate,
+                                cfg.rip_format,
+                            )
+                            if channels == 1:
+                                log.warning(
+                                    "The source is mono, so this rip will be mono too; pick a "
+                                    "source that reports '2ch' in `pactl list short sources` "
+                                    "and set the 'source' option to it"
+                                )
+                    elif command in {"STOP", "OFF"} and recorder.recording:
+                        stop_rip()
+                data = await tape.get()
+                if not recorder.recording:
+                    continue
+                recorder.write(data)
+                now = time.monotonic()
+                if now - last_report >= RIP_REPORT_SECONDS:
+                    last_report = now
+                    report()
+                if recorder.seconds >= cfg.rip_max_minutes * 60:
+                    log.info("Rip reached the %d minute limit; stopping", cfg.rip_max_minutes)
+                    stop_rip()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - a rip must not kill the listener
+                log.exception("Rip worker error: %s", err)
+                await asyncio.sleep(1)
+    finally:
+        if recorder.recording:
+            log.info("Add-on stopping; closing the rip")
+            stop_rip()
+
+
 async def run(cfg: Config, client: mqtt.Client) -> None:
     publish_discovery(client, cfg)
     publish(client, f"{cfg.base_topic}/availability", "online")
 
     state_topic = f"{cfg.base_topic}/state"
     playing_topic = f"{cfg.base_topic}/playing"
-    listen_bytes = int(cfg.bytes_per_second * cfg.listen_seconds)
-    prebuffer_bytes = int(cfg.bytes_per_second * PREBUFFER_SECONDS)
 
     shazam = Shazam()
     session = aiohttp.ClientSession()
     queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=240)
+    tape: asyncio.Queue[bytes] = asyncio.Queue(maxsize=RIP_QUEUE_CHUNKS)
+    commands: asyncio.Queue[str] = asyncio.Queue()
     active = {"active": True}
     watcher = (
         asyncio.create_task(watch_active_entity(cfg, session, active))
@@ -633,7 +911,33 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     )
 
     source = await asyncio.to_thread(find_source, cfg)
-    reader = asyncio.create_task(audio_reader(cfg, source, queue))
+    channels = await asyncio.to_thread(source_channels, source)
+    bytes_per_second = cfg.bytes_per_second(channels)
+    listen_bytes = int(bytes_per_second * cfg.listen_seconds)
+    prebuffer_bytes = int(bytes_per_second * PREBUFFER_SECONDS)
+    log.info(
+        "Capturing %s at %d Hz, %d channel(s) (clip %ss, %s dBFS gate)",
+        source,
+        cfg.sample_rate,
+        channels,
+        cfg.listen_seconds,
+        f"{cfg.noise_gate_db:.0f}",
+    )
+
+    loop = asyncio.get_running_loop()
+
+    def on_message(_client: mqtt.Client, _data: Any, message: mqtt.MQTTMessage) -> None:
+        payload = message.payload.decode("utf-8", "replace")
+        loop.call_soon_threadsafe(commands.put_nowait, payload)
+
+    client.on_message = on_message
+    client.subscribe(f"{cfg.base_topic}/rip/set")
+
+    async def tap(data: bytes) -> None:
+        await tape.put(data)
+
+    reader = asyncio.create_task(audio_reader(cfg, source, queue, channels, tap))
+    ripper = asyncio.create_task(rip_worker(cfg, channels, tape, commands, client))
 
     prebuffer = bytearray()
     clip = bytearray()
@@ -802,7 +1106,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if len(clip) >= listen_bytes and (now - last_attempt_at) >= cooldown:
                 last_attempt_at = now
                 new_segment = False
-                track = await recognise(shazam, cfg, bytes(clip[:listen_bytes]))
+                track = await recognise(shazam, cfg, bytes(clip[:listen_bytes]), channels)
                 clip = bytearray()
                 last_loud_at = time.monotonic()
                 while not queue.empty():
@@ -858,6 +1162,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                             recent.clear()
     finally:
         reader.cancel()
+        ripper.cancel()
         if watcher is not None:
             watcher.cancel()
         await session.close()
