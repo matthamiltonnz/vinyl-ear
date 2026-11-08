@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.11.2**.
+what the startup banner prints). Current: **0.11.3**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -277,17 +277,21 @@ patch the storage file from those, do not hand-edit the JSON.
     timeline with the cut offset added back to each cut point. Setting `recorder.frames` to the
     trimmed length and reporting again is what keeps the published duration honest — the
     retained payload had already gone out with the untrimmed side.
-19. **A source can be `RUNNING` and still deliver nothing, and nothing in the add-on noticed.**
-    Seen in the field after 0.11.1 went in: `pactl list sources short` said `RUNNING`, `parec`
-    was alive and attached, and the page showed `level: null` with no heartbeats — because the
-    read on `parec`'s pipe was blocked, so the chunk loop never ran, and the heartbeat, the gate,
-    the lookups and the rip all live behind that read. Digital silence is *not* this: a silent
-    source still sends bytes, so "no chunk for 30 s" is always a fault. `audio_reader()` is now a
-    supervisor around `capture_stream()`: a read that times out after `CAPTURE_STALL_SECONDS`
-    kills the process and reopens it with a growing backoff, and `run()`'s loop takes the queue
-    with `asyncio.wait_for`, noting "No audio from the source for 45 s — capture stalled?" in the
-    log and the event list (then every `CAPTURE_WARN_AGAIN_SECONDS`) and "Audio is back after …"
-    when it returns. Without that, a stalled capture is indistinguishable from a quiet room.
+19. **A source can be suspended — or `RUNNING` and delivering nothing — and nothing in the
+    add-on noticed.** Diagnosed on the live box after 0.11.1 went in: `parec` alive and
+    attached, `pactl` calling the source `RUNNING`, the page showing `level: null`, no
+    heartbeat, and nothing in `docker logs` after startup — because the read on `parec`'s pipe
+    was blocked, and the chunk loop, the gate, the lookups, the rip and the heartbeat all live
+    behind that read. `pactl suspend-source <source> 1` reproduces it within `CAPTURE_STALL_SECONDS`,
+    which is what the audio server does to an idle source: a `parec` that connects while it is
+    suspended never gets a byte. Digital silence is *not* this — a silent source still sends
+    bytes, so "no chunk for 30 s" always means the source, never a quiet room. Now
+    `audio_reader()` supervises `capture_stream()`: a read that times out kills the process,
+    asks `pactl suspend-source <name> 0` to resume the source and reopens with a growing
+    backoff, while `run()`'s loop takes the queue with `asyncio.wait_for` and notes "No audio
+    from the source for 30 s — capture stalled?" (then every `CAPTURE_WARN_AGAIN_SECONDS`) and
+    "Audio is back after …" when it returns. Verified live by suspending the source: the
+    warning, the reopen and the notes all appeared, and unsuspending brought the level back.
 20. **`status["auto"]` is written by the chunk loop, so it goes stale on a silent input.** The
     Rip panel said "auto-rip off" while both boxes were ticked: the settings row reads `cfg` on
     every poll, but the auto flags were a snapshot the loop refreshed — and a dead capture means

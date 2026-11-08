@@ -372,10 +372,11 @@ style that paints the cover, artist, title and album over the stream.
 - Shazam identification is via the reverse-engineered API (`shazamio`), the same way
   shazam2mqtt and ha_shazamio do it. It is free and needs no key, but it is unofficial:
   if it ever breaks, swap the client for ACRCloud or AudD behind the same interface.
-- If the capture stops delivering altogether — a source PulseAudio still calls `RUNNING` but
-  that hands over nothing — the add-on notices within 20 s, kills and reopens `parec`, and says
-  so in the log and the event list. A quiet record is not that: silence still arrives as chunks,
-  so "no audio from the source for 30 s" always means the source, not the room.
+- If the capture stops delivering altogether — a source the audio server has suspended, which
+  is what an idle source gets — the add-on notices within 20 s, resumes the source, kills and
+  reopens `parec`, and says so in the log and the event list. A quiet record is not that:
+  silence still arrives as chunks, so "no audio from the source for 30 s" always means the
+  source, not the room.
 - Expect ~15-25 s from needle drop to a published track: 15 s of audio plus the lookup.
 - Quiet passages, spoken intros and private pressings may not match. Nothing has been
   silent since the last match, so the album is kept and the track name is blanked

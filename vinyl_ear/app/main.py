@@ -52,7 +52,7 @@ RIP_SETTING_FIELDS = (
     "rip_auto_stop_seconds",
     "rip_split",
 )
-VERSION = "0.11.2"
+VERSION = "0.11.3"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -512,6 +512,7 @@ async def audio_reader(
             if stop.is_set():
                 return
             restarts += 1
+            await asyncio.to_thread(resume_source, source)
             delay = min(
                 CAPTURE_RESTART_MAX_SECONDS, CAPTURE_RESTART_SECONDS * restarts
             )
@@ -949,6 +950,19 @@ def pactl(*args: str, timeout: float = 10.0) -> str | None:
         )
         return None
     return result.stdout
+
+
+def resume_source(source: str) -> None:
+    """Undo a suspended source, which is what a capture that stalls usually is.
+
+    The audio server suspends an idle source, and a `parec` that connects while it is
+    suspended blocks on its pipe for ever. Reopening `parec` alone does not always help,
+    so the source is asked to resume first.
+    """
+    if not source:
+        return
+    if pactl("suspend-source", source, "0") is not None:
+        log.info("Asked the audio server to resume %s", source)
 
 
 def source_volume(source: str) -> float | None:
