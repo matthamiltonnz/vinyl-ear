@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import signal
 import statistics
@@ -37,7 +38,7 @@ ARTWORK_DIR = Path("/config/www/vinyl-art")
 # How many epoch-named covers to keep beside the fixed `device_name.jpg`.
 ARTWORK_KEEP = 5
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -74,6 +75,28 @@ HEARTBEAT_SECONDS = 300.0
 RIP_REPORT_SECONDS = 10.0
 # How long the rip worker waits for a chunk before looking at its command queue again.
 RIP_POLL_SECONDS = 0.5
+# Auto-rip: music above the gate for this long means the needle has dropped, and this long
+# below it means the side has ended. The start is deliberately shorter than the stop so the
+# run-out groove (which is noisy) does not stop a rip the moment the last track ends.
+AUTO_START_SECONDS = 3.0
+AUTO_COMMAND_GUARD_SECONDS = 5.0
+# Audio kept in front of the auto-start decision and written into the rip, so the first
+# seconds of the side are not lost to the time it takes to notice the music.
+RIP_PREROLL_SECONDS = 4.0
+# Gain calibration: aim the loudest sample at this level, measure over this long, and refuse
+# to touch the volume when the input is this quiet (nothing is playing) or already close.
+GAIN_TARGET_DBFS = -6.0
+GAIN_SAMPLE_SECONDS = 5.0
+GAIN_SILENT_DBFS = -50.0
+GAIN_DEADBAND_DB = 3.0
+GAIN_MIN_VOLUME = 5.0
+GAIN_MAX_VOLUME = 100.0
+# Track splitting: a gap is a stretch this much below the side's own loud level, this long,
+# and a piece has to be at least this long to count as a track.
+TRACK_GAP_DEPTH_DB = 18.0
+TRACK_GAP_SECONDS = 1.5
+TRACK_MIN_SECONDS = 10.0
+TRACK_MAX_COUNT = 24
 # The web UI is served on this port and reached through Home Assistant ingress (see
 # `ingress_port` in config.yaml); it is never published to the LAN.
 WEB_PORT = 8099
@@ -116,6 +139,10 @@ class Config:
     rip_dir: str
     rip_format: str
     rip_max_minutes: int
+    rip_auto: bool = False
+    rip_auto_gain: bool = False
+    rip_auto_stop_seconds: int = 20
+    rip_split: bool = False
 
     def bytes_per_second(self, channels: int = 1) -> int:
         return self.sample_rate * 2 * channels  # signed 16-bit little endian
@@ -149,6 +176,10 @@ def load_config() -> Config:
         rip_dir=str(raw.get("rip_dir") or "/share/vinyl-rips").strip(),
         rip_format=str(raw.get("rip_format") or "flac").strip().lower(),
         rip_max_minutes=int(raw.get("rip_max_minutes", 30)),
+        rip_auto=bool(raw.get("rip_auto", False)),
+        rip_auto_gain=bool(raw.get("rip_auto_gain", False)),
+        rip_auto_stop_seconds=int(raw.get("rip_auto_stop_seconds", 20)),
+        rip_split=bool(raw.get("rip_split", False)),
     )
 
 
@@ -292,6 +323,15 @@ def chunk_level(data: bytes) -> float:
         return -120.0
     rms = math.sqrt(sum(s * s for s in samples) / len(samples))
     return rms_to_dbfs(rms)
+
+
+def chunk_peak(data: bytes) -> int:
+    """The largest absolute 16-bit sample in a chunk, for level and peak tracking."""
+    samples = array.array("h")
+    samples.frombytes(data[: len(data) - (len(data) % 2)])
+    if not samples:
+        return 0
+    return max(max(samples), -min(samples))
 
 
 async def audio_reader(
@@ -702,6 +742,210 @@ def note(status: dict[str, Any], text: str) -> None:
     del events[:-40]
 
 
+def pactl(*args: str, timeout: float = 10.0) -> str | None:
+    """Run `pactl` (PULSE_SERVER comes from run.sh) and return its stdout, or None."""
+    try:
+        result = subprocess.run(
+            ["pactl", *args], capture_output=True, text=True, timeout=timeout
+        )
+    except (OSError, subprocess.SubprocessError) as err:
+        log.warning("pactl %s could not run (%s)", " ".join(args), err)
+        return None
+    if result.returncode != 0:
+        log.warning(
+            "pactl %s failed: %s", " ".join(args), (result.stderr or "").strip()[:160]
+        )
+        return None
+    return result.stdout
+
+
+def source_volume(source: str) -> float | None:
+    """The capture source's current volume in percent, or None when it cannot be read."""
+    output = pactl("get-source-volume", source)
+    if not output:
+        return None
+    match = re.search(r"(\d+)%", output)
+    return float(match.group(1)) if match else None
+
+
+def set_source_volume(source: str, percent: float) -> bool:
+    """Set the capture source's volume; returns whether pactl accepted it."""
+    return pactl("set-source-volume", source, f"{percent:.0f}%") is not None
+
+
+def percent_to_db(percent: float) -> float:
+    """PulseAudio's software volume is cubic: dB = 60 * log10(percent / 100)."""
+    return 60.0 * math.log10(max(percent, 0.1) / 100.0)
+
+
+def volume_for_delta(percent: float, delta_db: float) -> float:
+    """The volume percent that moves the source by `delta_db`, clamped to a sane range."""
+    linear = (max(percent, 0.1) / 100.0) ** 3 * 10.0 ** (delta_db / 20.0)
+    return max(GAIN_MIN_VOLUME, min(GAIN_MAX_VOLUME, 100.0 * linear ** (1.0 / 3.0)))
+
+
+def calibrate_gain(
+    source: str, measured_dbfs: float, status: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Aim the loudest sample of the record at GAIN_TARGET_DBFS by moving the capture gain.
+
+    Blocking (two pactl calls), so callers run it in a thread. The returned dict says what
+    happened; `change_db` is the dB the source actually moved, which is what a pre-roll has
+    to be scaled by so a rip does not change level part way through.
+    """
+    if measured_dbfs <= GAIN_SILENT_DBFS:
+        note(
+            status,
+            "Gain: nothing loud enough to measure (%.0f dBFS) — is the record playing?"
+            % measured_dbfs,
+        )
+        return None
+    volume = source_volume(source)
+    if volume is None:
+        note(status, "Gain: cannot read the source volume — is pactl available?")
+        return None
+    delta = GAIN_TARGET_DBFS - measured_dbfs
+    if abs(delta) < GAIN_DEADBAND_DB:
+        status["gain"] = {
+            "measured_dbfs": round(measured_dbfs, 1),
+            "volume": round(volume),
+            "change_db": 0.0,
+            "target_dbfs": GAIN_TARGET_DBFS,
+            "at": int(time.time()),
+        }
+        note(
+            status,
+            "Gain: %.0f dBFS peak at %.0f%% is already on target" % (measured_dbfs, volume),
+        )
+        return status["gain"]
+    wanted = volume_for_delta(volume, delta)
+    if not set_source_volume(source, wanted):
+        note(status, "Gain: could not set the source volume to %.0f%%" % wanted)
+        return None
+    applied = percent_to_db(wanted) - percent_to_db(volume)
+    status["gain"] = {
+        "measured_dbfs": round(measured_dbfs, 1),
+        "volume": round(wanted),
+        "volume_before": round(volume),
+        "change_db": round(applied, 1),
+        "target_dbfs": GAIN_TARGET_DBFS,
+        "at": int(time.time()),
+    }
+    note(
+        status,
+        "Gain: %.0f dBFS peak moved to volume %.0f%% (was %.0f%%, %+.1f dB)"
+        % (measured_dbfs, wanted, volume, applied),
+    )
+    log.info(
+        "Gain: %.0f dBFS peak at %.0f%% → %.0f%% (%+.1f dB), aiming for %.0f dBFS",
+        measured_dbfs,
+        volume,
+        wanted,
+        applied,
+        GAIN_TARGET_DBFS,
+    )
+    return status["gain"]
+
+
+def scale_pcm(data: bytes, factor: float) -> bytes:
+    """Multiply 16-bit samples by `factor` with clipping — pre-roll captured before a gain move."""
+    if abs(factor - 1.0) < 0.02:
+        return data
+    samples = array.array("h")
+    samples.frombytes(data[: len(data) - (len(data) % 2)])
+    for index, value in enumerate(samples):
+        scaled = int(value * factor)
+        if scaled > 32767:
+            samples[index] = 32767
+        elif scaled < -32768:
+            samples[index] = -32768
+        else:
+            samples[index] = scaled
+    return samples.tobytes()
+
+
+def find_track_gaps(
+    levels: list[float], chunk_seconds: float, duration: float
+) -> list[float]:
+    """Where one track ends and the next begins, from the chunk levels of a side.
+
+    A gap is a stretch at least TRACK_GAP_DEPTH_DB below the side's own loud level (its
+    90th percentile, so a quiet passage cannot set the bar) lasting TRACK_GAP_SECONDS. The
+    cut goes in the middle of the gap, and cuts that would leave a piece shorter than
+    TRACK_MIN_SECONDS are dropped, which also throws away lead-in and run-out gaps.
+    """
+    if len(levels) < 5 or chunk_seconds <= 0:
+        return []
+    ordered = sorted(levels)
+    loud = ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))]
+    floor = loud - TRACK_GAP_DEPTH_DB
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, level in enumerate(levels):
+        if level <= floor:
+            if start is None:
+                start = index
+        elif start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, len(levels)))
+    cuts: list[float] = []
+    for begin, end in runs:
+        if (end - begin) * chunk_seconds < TRACK_GAP_SECONDS:
+            continue
+        cut = (begin + end) / 2.0 * chunk_seconds
+        if cut < TRACK_MIN_SECONDS or cut > duration - TRACK_MIN_SECONDS:
+            continue
+        cuts.append(round(cut, 3))
+    return cuts
+
+
+def split_rip(path: Path, cuts: list[float], duration: float) -> list[Path]:
+    """Cut a finished side at `cuts` with a stream copy, keeping the whole-side file."""
+    if not cuts or len(cuts) > TRACK_MAX_COUNT:
+        return []
+    bounds = [0.0, *cuts, duration]
+    created: list[Path] = []
+    for index in range(len(bounds) - 1):
+        start, end = bounds[index], bounds[index + 1]
+        if end - start < TRACK_MIN_SECONDS:
+            continue
+        target = path.with_name(f"{path.stem}-{index + 1:02d}{path.suffix}")
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-nostdin",
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-ss",
+                    f"{start:.3f}",
+                    "-to",
+                    f"{end:.3f}",
+                    "-i",
+                    str(path),
+                    "-c",
+                    "copy",
+                    str(target),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except (OSError, subprocess.SubprocessError) as err:
+            log.warning("Could not cut %s (%s)", target.name, err)
+            break
+        if result.returncode != 0 or not target.exists():
+            log.warning(
+                "Could not cut %s (%s)", target.name, (result.stderr or "").strip()[:200]
+            )
+            break
+        created.append(target)
+    return created
+
+
 class RipRecorder:
     """Capture every chunk to disk, in the source's own channel count and rate.
 
@@ -717,6 +961,9 @@ class RipRecorder:
         self.frames = 0
         self.peak = 0
         self.file: Path | None = None
+        # One peak dBFS per chunk, in order: the timeline `find_track_gaps()` splits on.
+        self.levels: list[float] = []
+        self.chunk_seconds = 0.0
         self.wav_path: Path | None = None
         self._wav: "wave.Wave_write | None" = None
 
@@ -741,6 +988,8 @@ class RipRecorder:
         self.recording = True
         self.frames = 0
         self.peak = 0
+        self.levels = []
+        self.chunk_seconds = 0.0
 
     def write(self, data: bytes) -> None:
         if self._wav is None:
@@ -752,12 +1001,15 @@ class RipRecorder:
             self.finish()
             return
         self.frames += len(data) // (2 * self.channels)
-        samples = array.array("h")
-        samples.frombytes(data[: len(data) - (len(data) % 2)])
-        if samples:
-            level = max(max(samples), -min(samples))
+        if len(data) >= 2:
+            level = chunk_peak(data)
             if level > self.peak:
                 self.peak = level
+            if not self.chunk_seconds:
+                self.chunk_seconds = len(data) / float(
+                    2 * self.channels * self.cfg.sample_rate
+                )
+            self.levels.append(round(rms_to_dbfs(level), 1))
 
     def finish(self) -> Path | None:
         """Close the file, encode to FLAC when configured, and return what was kept."""
@@ -806,17 +1058,27 @@ class RipRecorder:
 
 async def rip_worker(
     cfg: Config,
+    source: str,
     channels: int,
     tape: "asyncio.Queue[bytes]",
     commands: "asyncio.Queue[str]",
     client: mqtt.Client,
     status: dict[str, Any],
 ) -> None:
-    """Record while a rip is running, on MQTT or web commands; ignore the tape otherwise."""
+    """Record while a rip is running, on MQTT, web or auto-rip commands.
+
+    The tape runs whether or not a rip does, so the last RIP_PREROLL_SECONDS of audio is
+    kept here: an auto start writes it into the file, which is what makes "the needle
+    dropped" lose nothing. While idle the tape is drained and thrown away.
+    """
     state_topic = f"{cfg.base_topic}/rip/state"
     info_topic = f"{cfg.base_topic}/rip"
     recorder = RipRecorder(cfg, channels)
     last_report = 0.0
+    preroll_budget = int(RIP_PREROLL_SECONDS * cfg.bytes_per_second(channels))
+    preroll: collections.deque[bytes] = collections.deque()
+    preroll_peaks: collections.deque[int] = collections.deque()
+    preroll_held = 0
 
     def report(retain: bool = False) -> None:
         current = recorder.wav_path if recorder.recording else recorder.file
@@ -834,10 +1096,95 @@ async def rip_worker(
         publish(client, state_topic, "ON" if recorder.recording else "OFF", retain=retain)
         publish(client, info_topic, json.dumps(payload), retain=retain)
 
-    def stop_rip() -> None:
+    def remember(data: bytes) -> None:
+        """Keep the last RIP_PREROLL_SECONDS of audio, and each chunk's peak with it."""
+        nonlocal preroll_held
+        preroll.append(data)
+        preroll_peaks.append(chunk_peak(data))
+        preroll_held += len(data)
+        while preroll_held > preroll_budget and len(preroll) > 1:
+            preroll_held -= len(preroll.popleft())
+            preroll_peaks.popleft()
+
+    async def measure_tape(seconds: float) -> float | None:
+        """Peak dBFS of the next `seconds` of tape, or None when nothing arrived."""
+        deadline = time.monotonic() + seconds
+        peak = 0
+        heard = 0
+        while time.monotonic() < deadline:
+            try:
+                data = tape.get_nowait()
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(0.05)
+                continue
+            heard += 1
+            peak = max(peak, chunk_peak(data))
+        if not heard:
+            return None
+        return rms_to_dbfs(peak)
+
+    async def gain_before_rip() -> float:
+        """Set the gain from the audio already in the pre-roll; return the pre-roll scale."""
+        if not preroll_peaks:
+            return 1.0
+        measured = rms_to_dbfs(max(preroll_peaks))
+        plan = await asyncio.to_thread(calibrate_gain, source, measured, status)
+        if not plan:
+            return 1.0
+        return 10.0 ** (float(plan.get("change_db") or 0.0) / 20.0)
+
+    def start_rip(with_preroll: bool = False, factor: float = 1.0) -> None:
+        """Open a new file; an auto start writes what was heard before the decision."""
+        nonlocal last_report, preroll_held
+        try:
+            recorder.start()
+        except OSError as err:
+            log.error("Cannot write a rip to %s (%s)", cfg.rip_dir, err)
+            note(status, "Cannot write a rip to %s (%s)" % (cfg.rip_dir, err))
+            report(retain=True)
+            return
+        last_report = 0.0
+        carried = 0
+        if with_preroll:
+            for data in list(preroll):
+                recorder.write(scale_pcm(data, factor))
+                carried += len(data)
+            preroll.clear()
+            preroll_peaks.clear()
+            preroll_held = 0
+        report(retain=True)
+        note(
+            status,
+            "Rip started: %s (%d ch, %d Hz, %s%s)"
+            % (
+                recorder.wav_path.name,
+                channels,
+                cfg.sample_rate,
+                cfg.rip_format,
+                ", %.0fs of pre-roll" % (carried / cfg.bytes_per_second(channels))
+                if carried
+                else "",
+            ),
+        )
+        log.info(
+            "Ripping to %s (%d ch, %d Hz, %s)",
+            recorder.wav_path,
+            channels,
+            cfg.sample_rate,
+            cfg.rip_format,
+        )
+        if channels == 1:
+            log.warning(
+                "The source is mono, so this rip will be mono too; pick a "
+                "source that reports '2ch' in `pactl list short sources` "
+                "and set the 'source' option to it"
+            )
+
+    async def stop_rip() -> None:
         seconds = recorder.seconds
         peak = recorder.peak_dbfs
         clipped = recorder.peak >= 32767
+        levels, chunk_seconds = list(recorder.levels), recorder.chunk_seconds
         path = recorder.finish()
         report(retain=True)
         if path is None:
@@ -853,6 +1200,22 @@ async def rip_worker(
             peak,
             ", CLIPPED - lower the capture gain" if clipped else "",
         )
+        if not cfg.rip_split:
+            return
+        cuts = find_track_gaps(levels, chunk_seconds, seconds)
+        if not cuts:
+            note(status, "No track gaps found in %s — left it whole" % path.name)
+            return
+        created = await asyncio.to_thread(split_rip, path, cuts, seconds)
+        if created:
+            note(
+                status,
+                "Split %s into %d tracks: %s …"
+                % (path.name, len(created), created[0].name),
+            )
+            log.info("Split %s into %d tracks", path.name, len(created))
+        else:
+            note(status, "Could not split %s; the whole side is kept" % path.name)
 
     report(retain=True)
     try:
@@ -861,36 +1224,30 @@ async def rip_worker(
                 while not commands.empty():
                     command = commands.get_nowait().strip().upper()
                     if command in {"START", "ON"} and not recorder.recording:
-                        try:
-                            recorder.start()
-                        except OSError as err:
-                            log.error("Cannot write a rip to %s (%s)", cfg.rip_dir, err)
-                            report(retain=True)
+                        start_rip()
+                    elif command == "AUTO" and not recorder.recording:
+                        factor = await gain_before_rip() if cfg.rip_auto_gain else 1.0
+                        start_rip(with_preroll=True, factor=factor)
+                    elif command == "GAIN":
+                        if recorder.recording:
+                            note(status, "Gain: stop the rip first — measuring would cut it")
                         else:
-                            last_report = 0.0
-                            report(retain=True)
-                            note(status, "Rip started: %s (%d ch, %d Hz, %s)" % (
-                                recorder.wav_path.name, channels, cfg.sample_rate,
-                                cfg.rip_format))
-                            log.info(
-                                "Ripping to %s (%d ch, %d Hz, %s)",
-                                recorder.wav_path,
-                                channels,
-                                cfg.sample_rate,
-                                cfg.rip_format,
-                            )
-                            if channels == 1:
-                                log.warning(
-                                    "The source is mono, so this rip will be mono too; pick a "
-                                    "source that reports '2ch' in `pactl list short sources` "
-                                    "and set the 'source' option to it"
+                            measured = await measure_tape(GAIN_SAMPLE_SECONDS)
+                            if measured is None:
+                                note(
+                                    status,
+                                    "Gain: no audio arriving — is the source connected?",
+                                )
+                            else:
+                                await asyncio.to_thread(
+                                    calibrate_gain, source, measured, status
                                 )
                     elif command in {"STOP", "OFF"} and recorder.recording:
-                        stop_rip()
+                        await stop_rip()
                 if recorder.recording and recorder.seconds >= cfg.rip_max_minutes * 60:
                     log.info("Rip reached the %d minute limit; stopping", cfg.rip_max_minutes)
                     note(status, "Rip reached the %d minute limit" % cfg.rip_max_minutes)
-                    stop_rip()
+                    await stop_rip()
                 try:
                     data = tape.get_nowait()
                 except asyncio.QueueEmpty:
@@ -898,6 +1255,7 @@ async def rip_worker(
                     # the capture stream has gone quiet or away.
                     await asyncio.sleep(RIP_POLL_SECONDS)
                     continue
+                remember(data)
                 if not recorder.recording:
                     continue
                 recorder.write(data)
@@ -913,7 +1271,10 @@ async def rip_worker(
     finally:
         if recorder.recording:
             log.info("Add-on stopping; closing the rip")
-            stop_rip()
+            path = recorder.finish()
+            report(retain=True)
+            if path is not None:
+                note(status, "Add-on stopped; closed the rip as %s" % path.name)
 
 
 async def run(cfg: Config, client: mqtt.Client) -> None:
@@ -978,6 +1339,8 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         "last_answer": None,
         "track": None,
         "events": [],
+        "gain": None,
+        "auto": {"enabled": cfg.rip_auto, "holding": False},
         "rip": {"state": "idle", "file": "", "seconds": 0, "peak_dbfs": -120,
                 "clipped": False, "channels": channels,
                 "sample_rate": cfg.sample_rate, "format": cfg.rip_format},
@@ -985,7 +1348,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
     reader = asyncio.create_task(audio_reader(cfg, source, queue, channels, tap))
     ripper = asyncio.create_task(
-        rip_worker(cfg, channels, tape, commands, client, status)
+        rip_worker(cfg, source, channels, tape, commands, client, status)
     )
     server = asyncio.create_task(web_server(cfg, status, commands))
 
@@ -996,6 +1359,12 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     current_key: tuple[str, str] | None = None
     last_track: dict[str, Any] | None = None
     last_identified_at: float = time.monotonic()
+    # Auto-rip bookkeeping: `auto_hold` keeps a hand-stopped rip from springing back up
+    # while the same side is still playing, and the guard keeps the command queue quiet.
+    was_recording = False
+    auto_hold = False
+    auto_owned = False
+    last_auto_command = 0.0
     # When the current uninterrupted stretch of sound began. Learning a floor while a
     # record is playing must not count the time since the add-on started as "nothing has
     # been recognised for five minutes".
@@ -1135,6 +1504,50 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                     clip = bytearray()
                 elif len(clip) < listen_bytes * 3:
                     clip.extend(data)
+
+            # Auto-rip: start on the needle drop, stop when the side has run out. The
+            # worker does the recording; this only decides when to ask it to.
+            recording = status["rip"].get("state") == "recording"
+            quiet_for = (now - last_loud_at) if last_loud_at is not None else math.inf
+            if cfg.rip_auto:
+                if recording and auto_owned:
+                    if quiet_for >= cfg.rip_auto_stop_seconds:
+                        commands.put_nowait("OFF")
+                        last_auto_command = now
+                        auto_owned = False
+                        note(
+                            status,
+                            "Auto-rip: quiet for %ds — stopping"
+                            % cfg.rip_auto_stop_seconds,
+                        )
+                elif recording:
+                    # Started from the switch or the page: not ours to stop.
+                    auto_hold = False
+                elif was_recording and auto_owned:
+                    # Our rip ended while the input was still loud — a hand stop, or the
+                    # time limit. Do not spring back up until the side has actually ended.
+                    auto_owned = False
+                    if quiet_for < cfg.rip_auto_stop_seconds:
+                        auto_hold = True
+                        note(
+                            status,
+                            "Auto-rip: stopped by hand — waiting for the side to end",
+                        )
+                elif auto_hold:
+                    if quiet_for >= cfg.rip_auto_stop_seconds:
+                        auto_hold = False
+                        note(status, "Auto-rip: quiet — re-armed")
+                elif (
+                    quiet_for <= GATE_HOLD_SECONDS
+                    and now - segment_started_at >= AUTO_START_SECONDS
+                    and now - last_auto_command >= AUTO_COMMAND_GUARD_SECONDS
+                ):
+                    commands.put_nowait("AUTO")
+                    last_auto_command = now
+                    auto_owned = True
+                    note(status, "Auto-rip: sound for %ds — starting" % AUTO_START_SECONDS)
+            was_recording = recording
+            status["auto"] = {"enabled": cfg.rip_auto, "holding": auto_hold}
 
             prebuffer.extend(data)
             if len(prebuffer) > prebuffer_bytes:
@@ -1290,6 +1703,8 @@ INDEX_HTML = (
   button { font: inherit; border: 0; border-radius: 10px; padding: 9px 18px; cursor: pointer;
            background: #2b6cb0; color: #fff; }
   button.stop { background: #b02b2b; }
+  button.quiet { background: #37474f; }
+  .buttons { display: flex; gap: 10px; flex-wrap: wrap; }
   button:disabled { opacity: .45; cursor: default; }
   table { width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: 12px; }
   th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #1d2430; }
@@ -1341,7 +1756,12 @@ INDEX_HTML = (
     <div class="row"><span>elapsed</span><span id="ripElapsed">—</span></div>
     <div class="row"><span>peak</span><span id="ripPeak">—</span></div>
     <div class="row"><span>file</span><span id="ripFile">—</span></div>
-    <p><button id="ripButton">Start a rip</button></p>
+    <div class="row"><span>gain</span><span id="gain">—</span></div>
+    <div class="row"><span>auto-rip</span><span id="auto">off</span></div>
+    <p class="buttons">
+      <button id="ripButton">Start a rip</button>
+      <button id="gainButton" class="quiet">Set the gain</button>
+    </p>
     <table>
       <thead><tr><th>recording</th><th>size</th><th></th></tr></thead>
       <tbody id="files"><tr><td colspan="3" class="muted">no rips yet</td></tr></tbody>
@@ -1427,10 +1847,20 @@ function renderRip(status) {
     ? db(rip.peak_dbfs) + (rip.clipped ? " — clipping" : "")
     : "—";
   $("ripFile").textContent = rip.file ? rip.file.split("/").pop() : "—";
+  const gain = status.gain || {};
+  $("gain").textContent = gain.measured_dbfs === undefined || gain.measured_dbfs === null
+    ? "—"
+    : db(gain.measured_dbfs) + " peak → " + (gain.volume ?? "?") + "%"
+      + (gain.change_db ? " (" + (gain.change_db > 0 ? "+" : "") + gain.change_db + " dB)" : "");
+  const auto = status.auto || {};
+  $("auto").textContent = !auto.enabled
+    ? "off"
+    : (auto.holding ? "armed, holding (stopped by hand)" : "armed");
   const button = $("ripButton");
   button.textContent = recording ? "Stop the rip" : "Start a rip";
   button.className = recording ? "stop" : "";
   button.disabled = ripBusy;
+  $("gainButton").disabled = ripBusy || recording;
 
   const rows = (status.rips || []).map((file) => {
     const row = document.createElement("tr");
@@ -1510,6 +1940,7 @@ async function refresh() {
 async function ripAction(action) {
   ripBusy = true;
   $("ripButton").disabled = true;
+  $("gainButton").disabled = true;
   try {
     const response = await fetch("api/rip", {
       method: "POST",
@@ -1538,6 +1969,8 @@ async function deleteRip(name) {
 $("ripButton").onclick = () => {
   ripAction($("ripState").textContent === "recording" ? "stop" : "start");
 };
+
+$("gainButton").onclick = () => ripAction("gain");
 
 refresh();
 setInterval(refresh, 1000);
@@ -1628,8 +2061,12 @@ async def web_server(
             await commands.put("ON")
         elif action == "stop":
             await commands.put("OFF")
+        elif action == "gain":
+            await commands.put("GAIN")
         else:
-            return web.json_response({"error": "action must be start or stop"}, status=400)
+            return web.json_response(
+                {"error": "action must be start, stop or gain"}, status=400
+            )
         return web.json_response({"ok": True, "action": action})
 
     async def api_file(request: web.Request) -> web.StreamResponse:

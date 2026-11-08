@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.7.1**.
+what the startup banner prints). Current: **0.8.0**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -210,6 +210,28 @@ patch the storage file from those, do not hand-edit the JSON.
     which serves commands and the time limit whatever the audio is doing. Found by feeding
     `rip_worker()` a hand-made tape: the fake reader stopped, and `OFF` sat in the queue
     while the state stayed `recording`.
+12. **PulseAudio's volume is cubic, and `pactl` needs the resolved source name.** Raising a
+    source from 50 % to 63 % is +6 dB, not +26 %: the software volume curve is cubic, so
+    `dB = 60·log10(percent/100)` and the inverse is `percent = 100·(linear·10^(dB/20))^(1/3)`
+    (`percent_to_db()` / `volume_for_delta()`). Getting this wrong makes auto-gain lurch by
+    20 dB and clip the side. The other trap is the name: `cfg.source` may be empty (auto-pick)
+    and `find_source()` decides at startup, so `calibrate_gain()` is given the *resolved*
+    name — that is why `rip_worker()` takes `source`. Also: the volume is a property of the
+    source, not of the rip, so it changes what the listener hears too, and it does not survive
+    an audio-container restart.
+13. **A gap in a recording is not silence.** `find_track_gaps()` runs on the peak level of each
+    chunk as it was written, so surface noise in a gap (which can sit only 15-20 dB under the
+    music) is what it sees, not digital zero. That is why the threshold is *relative* — the
+    side's own 90th percentile minus `TRACK_GAP_DEPTH_DB` — rather than the noise gate or a
+    fixed dBFS: a quiet classical side and a loud compressed side both split correctly, and a
+    quiet passage 10 dB down is not mistaken for a break. It is still a heuristic, so the
+    whole-side file is never deleted, and a side with too many or too few gaps is left whole.
+14. **The split happens after the rip is reported idle.** `stop_rip()` closes and encodes the
+    file, calls `report()` (which is what publishes `state: idle`), *then* splits. A test (or
+    a script) that polls for `idle` and immediately cancels the worker throws away the split
+    mid-flight, which looks exactly like "splitting never ran" — no "Split …" event and no
+    track files. Wait for the `Split …`/`No track gaps` event instead. In the add-on itself
+    the same window is why the web UI can show idle while tracks are still appearing.
 
 ## Ripping
 
@@ -220,6 +242,46 @@ lives on `vinyl_ear/<device>/rip` (progress JSON) and `.../rip/state` (`ON`/`OFF
 and the switch entity drives `.../rip/set`. `rip_max_minutes` bounds a forgotten switch.
 Files land in `rip_dir`, `/share/vinyl-rips` by default, which is why the manifest now maps
 `share:rw`.
+
+### Auto-rip, gain and splitting (0.8.0)
+
+Three things sit on top of that, and each has one owner so there is no second opinion:
+
+- **Auto-rip lives in `run()`**, not in the worker, because `run()` is what knows the gate,
+  the chunk levels and `segment_started_at`. It queues `AUTO` (start, with pre-roll) and
+  `OFF` on the same `commands` queue the switch and the web UI use — the worker still decides
+  how to record. Start needs `AUTO_START_SECONDS` of unbroken sound above the gate; stop
+  needs `cfg.rip_auto_stop_seconds` of quiet. A rip stopped **by hand** sets `auto_hold`, which
+  is only cleared once the input has been quiet for the same window: without it, pressing Stop
+  mid-side would be undone by the next chunk of music. `AUTO_COMMAND_GUARD_SECONDS` stops the
+  loop from queueing a command on every chunk while the worker catches up.
+  Two flags make the state machine behave, and both came out of watching it misbehave:
+  `auto_owned` remembers whether *we* started the rip, because a rip started from the
+  switch or the page must never be stopped by auto-rip (a hand start on a silent stretch
+  would otherwise be killed by the first quiet window); and a start also requires
+  `quiet_for <= GATE_HOLD_SECONDS`, i.e. sound *now*, because `segment_started_at` only
+  moves when a loud chunk follows a gap — without that test, any silence after any music
+  looks like "the same uninterrupted stretch has been going for ages" and auto-rip starts
+  recording silence.
+- **Pre-roll lives in `rip_worker()`**: every chunk goes into a deque holding
+  `RIP_PREROLL_SECONDS` of audio (and its peak, so the gain can be planned without rescanning
+  the samples). An `AUTO` start writes that ring into the new file first, so the three seconds
+  spent deciding lose nothing.
+- **Gain** is `calibrate_gain()` plus `pactl`: `get-source-volume` → the percent that puts the
+  measured peak at `GAIN_TARGET_DBFS` → `set-source-volume`. It needs the *resolved* source
+  name, which is why `rip_worker()` takes `source` as an argument (the `source` option may be
+  empty and `find_source()` decided at startup). `change_db` is what the source really moved
+  (after clamping), and an auto start scales the pre-roll by `10 ** (change_db / 20)` so the
+  side does not jump in level four seconds in.
+- **Splitting** uses the levels the recorder already computes (`RipRecorder.levels`, one peak
+  dBFS per chunk, with `chunk_seconds` for the timeline): `find_track_gaps()` puts a cut in the
+  middle of every stretch that is `TRACK_GAP_DEPTH_DB` below the side's 90th percentile and
+  `TRACK_GAP_SECONDS` long, dropping cuts that would leave a piece under `TRACK_MIN_SECONDS`
+  (which also discards lead-in and run-out) or more than `TRACK_MAX_COUNT` of them.
+  `split_rip()` then does `ffmpeg -ss … -to … -c copy` per piece in a thread, keeping the
+  whole-side file. It runs *after* `finish()` and after the idle report, so a client polling
+  for `state == "idle"` can see idle before the tracks appear — tests have to wait for the
+  "Split …"/"No track gaps" event, not for idle.
 
 ## Web interface
 
@@ -235,8 +297,8 @@ measured floor, last lookup time and answer, the published track, the rip snapsh
 40-line event log through `note()` — and `rip_worker()` writes the very object `report()`
 publishes to `.../rip` into `status["rip"]`, so the page agrees with Home Assistant by
 construction. The page polls `/api/status` once a second. `POST /api/rip` with
-`{"action":"start"|"stop"}` puts `ON`/`OFF` on **the same `commands` queue the MQTT switch
-uses**, so there is one worker and one code path. Recordings are served by *name* only
+`{"action":"start"|"stop"|"gain"}` puts `ON`/`OFF`/`GAIN` on **the same `commands` queue the
+MQTT switch uses**, so there is one worker and one code path. Recordings are served by *name* only
 (`GET /files/<name>`, `?download=1`, `DELETE`), resolved inside `rip_dir` with a parent
 check: there is no path parameter to traverse, and this is the add-on's only write/delete
 surface.
@@ -309,6 +371,24 @@ allowed to go *dry* before `OFF` is queued. The whole `run()` can be driven the 
 `audio_reader`, `recognise`, `cache_artwork`, `publish_discovery`, `find_source` and
 `source_channels` monkeypatched and `Shazam` stubbed with a bare class; that is what proves the
 page reads the live `status` rather than a snapshot.
+
+The 0.8.0 features are testable the same way, and each has one thing that is easy to get
+wrong:
+
+- **Auto-gain** — monkeypatch `mod.source_volume` (return a percent) and
+  `mod.set_source_volume` (record the call, return True) instead of shelling out to `pactl`;
+  `calibrate_gain()` looks both up in module globals. Feed chunks at a known amplitude
+  (`amplitude 4000` ≈ -18 dBFS) and expect the volume the maths implies (≈ 80 % from 50 %
+  for a -6 dBFS target), then feed `GAIN` on the command queue and check `status["gain"]`.
+- **Auto-rip** — run the whole `run()` with a fake `audio_reader` whose chunks come from a
+  mutable `phase` (`music`/`quiet`), shrink `mod.AUTO_START_SECONDS` and
+  `mod.AUTO_COMMAND_GUARD_SECONDS` to about a second, set `rip_auto_stop_seconds` to 4 and
+  drive it through: music → recorded, web `stop` → `auto_hold`, music → *still* idle, quiet →
+  "re-armed", music → a second side. Sending the hand stop through `POST /api/rip` also
+  proves it shares the MQTT path.
+- **Splitting** — `find_track_gaps()` takes plain level lists, so it can be checked without
+  audio at all; `split_rip()` needs real ffmpeg, so write a 36 s WAV, cut at 12/24 and probe
+  the pieces with `ffprobe`. Remember gotcha 14: wait for the `Split …` event, not for idle.
 
 ## Release checklist
 

@@ -186,6 +186,10 @@ sampled four times a second rather than in bursts:
 | `rip_dir` | `/share/vinyl-rips` | Where a rip is written. `/share`, `/media` and `/config` are all writable from the add-on; `/media/vinyl-rips` also shows up in Home Assistant's Media browser. |
 | `rip_format` | `flac` | `flac` (lossless, about a third of the size) or `wav` (uncompressed). Both keep exactly what the input delivered. |
 | `rip_max_minutes` | `30` | A rip stops itself after this long, so a forgotten switch cannot fill the disk. A 12" side is 20-25 minutes. |
+| `rip_auto` | `false` | Arm the ripper: a side starts on its own three seconds after music appears and stops after `rip_auto_stop_seconds` of quiet. |
+| `rip_auto_gain` | `false` | Before an auto rip starts, move the capture gain so the record's peak lands near -6 dBFS (the pre-roll is scaled to match, so the side stays level). |
+| `rip_auto_stop_seconds` | `20` | How quiet, and for how long, counts as "the side has ended". The run-out groove makes noise, so shorter is usually worse. |
+| `rip_split` | `false` | Cut a finished side at its silences into `<name>-01`, `<name>-02`, … The whole-side file is kept. |
 
 ## Ripping a record
 
@@ -195,6 +199,27 @@ the needle; switch it off when the side ends. The listener keeps running while i
 it is the same audio — so names keep appearing in the dashboard as the side plays. The
 finished file is `/share/vinyl-rips/<device_name>-<YYYYmmdd-HHMMSS>.flac`, and the switch's
 attributes carry the file, the elapsed seconds and the peak level.
+
+Or leave it to the add-on. With `rip_auto` on, the ripper arms itself: sound above the noise
+gate for three seconds starts a side, and `rip_auto_stop_seconds` of quiet (20 s by default —
+the run-out groove is noisy, so give it room) ends it. The audio from *before* the decision is
+kept, because the last four seconds of capture are held in a ring buffer and written into the
+file, so nothing of the first track is lost. Stopping a rip by hand does not fight you: the
+add-on holds off until the side has been quiet again, then re-arms. With `rip_auto_gain` on,
+an auto start first aims the capture gain: the pre-roll already says how loud the record is, so
+the source volume is moved to put its loudest sample near -6 dBFS, and the pre-roll is scaled
+by the same amount so the side does not change level part way through.
+
+`rip_split` cuts a finished side at its silences — gaps at least 1.5 s long and 18 dB below
+the side's own loud level — into `<name>-01.flac`, `<name>-02.flac`, … with a stream copy. The
+whole-side file is kept, so nothing is lost if a side has no gaps worth cutting, and a side
+with more than 24 of them is left alone.
+
+**Set the gain** in the web interface (or payload `GAIN` on `.../rip/set`) does the same
+calibration on demand: it listens for five seconds, reads the source volume with
+`pactl get-source-volume`, works out the percent that puts the peak at -6 dBFS
+(PulseAudio's volume curve is cubic, so dB = 60·log₁₀(percent/100)) and sets it. Handy before
+a manual rip, and it refuses to act on silence or while a rip is running.
 
 Some things decide whether the result is worth keeping:
 
@@ -235,10 +260,12 @@ installation.
   a ~30 s level history (green once a chunk is above the gate), the gate and the measured
   room floor, whether audio is above the gate, how many lookups Shazam has refused, how long
   ago the last lookup was and what it answered.
-- **Rip** — state, elapsed time, peak level and the file being written, a Start/Stop button
-  that does exactly what the MQTT switch does, and the finished recordings in `rip_dir` with
-  their sizes. Each can be played, downloaded or deleted. Files are addressed by name and
-  only inside `rip_dir`, so nothing else on the disk is reachable.
+- **Rip** — state, elapsed time, peak level and the file being written, whether auto-rip is
+  armed (and holding after a hand stop), what the last gain calibration did, a Start/Stop
+  button and a **Set the gain** button that do exactly what the MQTT switch does, and the
+  finished recordings in `rip_dir` with their sizes. Each can be played, downloaded or
+  deleted. Files are addressed by name and only inside `rip_dir`, so nothing else on the disk
+  is reachable; the file being written is refused until it is closed.
 - **Event log** — the last 40 things that happened: recognitions, refusals, gate changes and
   rip starts and stops. It is the quickest way to tell "the record is not being heard" from
   "it is heard but Shazam does not know it".
@@ -297,3 +324,17 @@ style that paints the cover, artist, title and album over the stream.
   published: the page has no password of its own, so exposing it to the LAN would hand
   anyone on the network the Start/Stop button and the delete links. Reach it from the
   add-on page, or add it to the sidebar.
+- Auto-rip hears the same gate the listener does, so it starts on anything loud enough for
+  long enough — a door slamming three times, a loud conversation near the microphone. Two
+  things keep that honest: it only listens while the activity entity is on, and the
+  recorder stops at `rip_max_minutes` whatever it thinks it heard.
+- Auto-rip stops on quiet, and a locked run-out groove can keep clicking above the gate
+  indefinitely. If a side never stops by itself, raise `rip_auto_stop_seconds`, or use the
+  switch — the time limit is the backstop either way.
+- Auto-gain writes to the *capture source's* volume, which is the same setting
+  `pactl set-source-volume` changes: it persists for the PulseAudio session and affects the
+  listener as well, not just the rip. It is deliberately capped at 100 %—asking for more
+  amplifies the room along with the record and cannot recover a source that is too quiet.
+- Track splitting is a guess made from levels. A side mixed gapless, a classical movement
+  with long quiet bars, or a locked run-out will not cut where you expect; the whole-side
+  file is always kept, so the guess is never destructive.
