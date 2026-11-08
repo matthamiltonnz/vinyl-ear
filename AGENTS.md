@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.10.0**.
+what the startup banner prints). Current: **0.11.0**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -258,6 +258,26 @@ patch the storage file from those, do not hand-edit the JSON.
     `wav`, the files came out `flac`. It is read in `start()` instead, so one side cannot change
     format half way through and the next side still picks the new setting up.
 
+18. **Auto-rip that starts on its own is not what ripping a record wants, and a silent
+    recording is not a finished side.** One `rip_auto` switch meant both halves, so the only way
+    to get "stop when the side ends" was to also accept a rip appearing whenever the room got
+    loud enough for three seconds. 0.11.0 splits it into `rip_auto_start` (default off) and
+    `rip_auto_stop` (default on). The stopping half needed a second guard as well: quiet for
+    `rip_auto_stop_seconds` used to be enough, which ended a hand start while the record was
+    still being brushed, so a stop now also requires that this rip has heard music. And because
+    a hand start begins before the needle drops, the finished file carries the run-in: with
+    `rip_trim` on (default), `trim_rip()` cuts the run-in and run-out, keeping
+    `TRIM_LEAD_SECONDS` (0.5 s) of music on either side, on the same percentile test
+    (`loud_window()`) that `find_track_gaps()` uses, and a side whose levels never rise above
+    the gate is left alone rather than trimmed to nothing. A WAV is cut with a stream copy,
+    which is sample accurate; a FLAC is *re-encoded* (`-c:a flac`, still lossless) because a
+    `-c copy` cut keeps the original STREAMINFO, so the trimmed file still claims the whole
+    side — `ffprobe` said 44 s for 11 s of audio, and every player would agree with it. The
+    split then runs on the trimmed
+    timeline with the cut offset added back to each cut point. Setting `recorder.frames` to the
+    trimmed length and reporting again is what keeps the published duration honest — the
+    retained payload had already gone out with the untrimmed side.
+
 ## Ripping
 
 `RipRecorder` + `rip_worker()` write WAV as the chunks arrive (a `wave` handle, patched on
@@ -268,7 +288,7 @@ and the switch entity drives `.../rip/set`. `rip_max_minutes` bounds a forgotten
 Files land in `rip_dir`, `/share/vinyl-rips` by default, which is why the manifest now maps
 `share:rw`.
 
-### Where the rip settings live (0.10.0)
+### Where the rip settings live (0.10.0, extended 0.11.0)
 
 The rip knobs are **not add-on options**: they are edited in the web UI (`PATCH /api/settings`)
 and kept in `RIP_SETTINGS_FILE` (`/data/rip-settings.json`), because the supervisor only writes
@@ -280,28 +300,32 @@ next split) sees the new value immediately; only the file write is blocking, hen
 the file is missing (first run on this version), seeds it from whatever the add-on options say —
 so an upgrade keeps the settings it had. The old `rip_*` keys have been removed from
 `config.yaml`; the supervisor prunes them from `/data/options.json` (it logs a warning about an
-option outside the schema until it does).
+option outside the schema until it does). 0.11.0 added `rip_auto_start`, `rip_auto_stop` and
+`rip_trim` to the file: `load_rip_settings()` maps a saved `rip_auto` onto both halves when the
+new keys are absent, so an upgrade keeps whatever it meant, while `load_config()` keeps the same
+fallback for a `/data/options.json` written by 0.10.x.
 
-### Auto-rip, gain and splitting (0.8.0)
+### Auto-rip, gain, trimming and splitting (0.8.0, split up in 0.11.0)
 
-Three things sit on top of that, and each has one owner so there is no second opinion:
+Four things sit on top of that, and each has one owner so there is no second opinion:
 
 - **Auto-rip lives in `run()`**, not in the worker, because `run()` is what knows the gate,
-  the chunk levels and `segment_started_at`. It queues `AUTO` (start, with pre-roll) and
-  `OFF` on the same `commands` queue the switch and the web UI use — the worker still decides
-  how to record. Start needs `AUTO_START_SECONDS` of unbroken sound above the gate; stop
-  needs `cfg.rip_auto_stop_seconds` of quiet. A rip stopped **by hand** sets `auto_hold`, which
-  is only cleared once the input has been quiet for the same window: without it, pressing Stop
-  mid-side would be undone by the next chunk of music. `AUTO_COMMAND_GUARD_SECONDS` stops the
-  loop from queueing a command on every chunk while the worker catches up.
-  Two flags make the state machine behave, and both came out of watching it misbehave:
-  `auto_owned` remembers whether *we* started the rip, because a rip started from the
-  switch or the page must never be stopped by auto-rip (a hand start on a silent stretch
-  would otherwise be killed by the first quiet window); and a start also requires
-  `quiet_for <= GATE_HOLD_SECONDS`, i.e. sound *now*, because `segment_started_at` only
-  moves when a loud chunk follows a gap — without that test, any silence after any music
-  looks like "the same uninterrupted stretch has been going for ages" and auto-rip starts
-  recording silence.
+  the chunk levels and `segment_started_at`. Since 0.11.0 it is two settings, `rip_auto_start`
+  (off by default — a side is normally started by hand before the needle drops) and
+  `rip_auto_stop` (on by default), both fed through the same `commands` queue the switch and the
+  web UI use, so the worker still decides how to record. Stop needs
+  `cfg.rip_auto_stop_seconds` of quiet *and* `rip_heard_music`, a flag any chunk above the gate
+  sets during this rip and a stop clears: without it, pressing Start and then taking a minute to
+  brush the record looked exactly like a finished side and the rip killed itself. Start needs
+  `AUTO_START_SECONDS` of unbroken sound above the gate, and a start also requires
+  `quiet_for <= GATE_HOLD_SECONDS`, i.e. sound *now*, because `segment_started_at` only moves
+  when a loud chunk follows a gap — without that test any silence after any music looks like
+  "the same uninterrupted stretch has been going for ages" and auto-rip starts recording
+  silence. A rip stopped **by hand** sets `auto_hold`, cleared only once the input has been
+  quiet for the stop window, so pressing Stop mid-side is not undone by the next chunk of music;
+  `AUTO_COMMAND_GUARD_SECONDS` keeps the loop from queueing a command on every chunk while the
+  worker catches up. There is no longer an `auto_owned` flag: auto stop applies to a
+  hand-started rip too, which is the whole point of splitting the setting.
 - **Pre-roll lives in `rip_worker()`**: every chunk goes into a deque holding
   `RIP_PREROLL_SECONDS` of audio (and its peak, so the gain can be planned without rescanning
   the samples). An `AUTO` start writes that ring into the new file first, so the three seconds
@@ -321,6 +345,16 @@ Three things sit on top of that, and each has one owner so there is no second op
   whole-side file. It runs *after* `finish()` and after the idle report, so a client polling
   for `state == "idle"` can see idle before the tracks appear — tests have to wait for the
   "Split …"/"No track gaps" event, not for idle.
+- **Trimming** runs first, in `stop_rip()` after `finish()`, and is the answer to the lead-in a
+  hand start always has: `loud_window()` finds the first and last chunk within
+  `TRACK_GAP_DEPTH_DB` of the side's 90th percentile, `trim_rip()` re-cuts the file with
+  `ffmpeg -ss … -to … -c copy` for a WAV (sample accurate, honest header) and a lossless
+  `-c:a flac` re-encode for a FLAC, because a copy keeps the original STREAMINFO and the cut
+  file goes on claiming the untrimmed length. It keeps
+  `TRIM_LEAD_SECONDS` either side, and `recorder.frames` is set to the trimmed length so the
+  re-reported duration matches the file. Nothing to trim (already tight, or a side that never
+  rose above the gate) returns `None` and leaves the file alone; the split then works on the
+  trimmed level slice with the offset added back to each cut.
 
 ## Streaming
 
@@ -457,10 +491,21 @@ wrong:
   for a -6 dBFS target), then feed `GAIN` on the command queue and check `status["gain"]`.
 - **Auto-rip** — run the whole `run()` with a fake `audio_reader` whose chunks come from a
   mutable `phase` (`music`/`quiet`), shrink `mod.AUTO_START_SECONDS` and
-  `mod.AUTO_COMMAND_GUARD_SECONDS` to about a second, set `rip_auto_stop_seconds` to 4 and
-  drive it through: music → recorded, web `stop` → `auto_hold`, music → *still* idle, quiet →
-  "re-armed", music → a second side. Sending the hand stop through `POST /api/rip` also
-  proves it shares the MQTT path.
+  `mod.AUTO_COMMAND_GUARD_SECONDS` to about a second, set `rip_auto_stop_seconds` to 4 and turn
+  `rip_auto_start` **on** to exercise the hands-off path: music → recorded, web `stop` →
+  `auto_hold`, music → *still* idle, quiet → "re-armed", music → a second side. Sending the hand
+  stop through `POST /api/rip` also proves it shares the MQTT path. With `rip_auto_start`
+  **off** (the shipped default) the hand path has to hold too: an `ON` while nothing is playing
+  and then 20 s of quiet must *not* stop it (no music heard yet), and a stop must follow 4 s
+  after the music ends. That is the case the flag exists for.
+- **Trimming** — `loud_window()` takes plain levels, so it needs no audio; `trim_rip()` needs
+  ffmpeg, so write a 30 s WAV of 8 s silence, 14 s tone, 8 s silence, trim it and probe: about
+  15 s, still `pcm_s16le`, and only the one file left. Do the same with a FLAC (`-c:a flac`
+  `side.flac`) and probe it too — a `-c copy` cut of a FLAC *fails* that probe with the original
+  length, which is the trap that made the trim look broken while the audio was already right.
+  Check the no-op cases as well — levels that never rise all return `None` (nothing is trimmed
+  to nothing), as does a side with nothing to cut — and that `find_track_gaps()` cuts still land
+  in the right place once `stop_rip()` has added the trim offset back.
 - **Splitting** — `find_track_gaps()` takes plain level lists, so it can be checked without
   audio at all; `split_rip()` needs real ffmpeg, so write a 36 s WAV, cut at 12/24 and probe
   the pieces with `ffprobe`. Remember gotcha 14: wait for the `Split …` event, not for idle.

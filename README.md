@@ -190,7 +190,7 @@ sampled four times a second rather than in bursts:
 ## Ripping a record
 
 Everything about ripping is set in the add-on's **web interface**, in the *Rip settings*
-panel: folder, format, the time limit, auto-rip, auto-gain and splitting. They take effect the
+panel: folder, format, the time limit, auto-rip, auto-gain, trimming and splitting. They take effect the
 moment you press **Save settings** — no restart — and are kept in `/data/rip-settings.json`, so
 they survive updates and rebuilds. They are deliberately *not* add-on options any more: those
 are written only by the supervisor, and only take effect on a restart, which is the wrong shape
@@ -203,15 +203,25 @@ it is the same audio — so names keep appearing in the dashboard as the side pl
 finished file is `/share/vinyl-rips/<device_name>-<YYYYmmdd-HHMMSS>.flac`, and the switch's
 attributes carry the file, the elapsed seconds and the peak level.
 
-Or leave it to the add-on. With `rip_auto` on, the ripper arms itself: sound above the noise
-gate for three seconds starts a side, and `rip_auto_stop_seconds` of quiet (20 s by default —
-the run-out groove is noisy, so give it room) ends it. The audio from *before* the decision is
-kept, because the last four seconds of capture are held in a ring buffer and written into the
-file, so nothing of the first track is lost. Stopping a rip by hand does not fight you: the
-add-on holds off until the side has been quiet again, then re-arms. With `rip_auto_gain` on,
-an auto start first aims the capture gain: the pre-roll already says how loud the record is, so
-the source volume is moved to put its loudest sample near -6 dBFS, and the pre-roll is scaled
-by the same amount so the side does not change level part way through.
+Or leave the end of the side to the add-on. **auto stop** ends a rip that has heard music
+once the input has been quiet for `auto stop … seconds` — the run-out groove is noisy, so
+give it room, and 20 s is a good start. A rip you started by hand is stopped by this too,
+but only after it has actually heard something, so time spent brushing the record before
+the needle drops is never mistaken for the end of a side. **auto start** is the other half
+and is off unless you switch it on: with it on, three seconds of sound above the noise gate
+starts a side on its own, and stopping by hand while the record is still playing puts it on
+hold until the input has been quiet for the same window. An auto start also aims the
+capture gain first: the pre-roll from before that decision is scaled by the same amount, so
+the side does not change level a few seconds in.
+
+Because a hand-started side starts recording before the music does, **trim silence** (on by
+default) cuts the run-in and the run-out off the finished file, keeping half a second of
+either side of the music — a record that sat spinning while you found the sleeve does not
+arrive with a minute of nothing in front of the first track. The cut is lossless either way —
+a stream copy for WAV, a re-encode for FLAC, which is
+also lossless and is necessary because a copied FLAC keeps the original length in its
+header — and a side whose levels never rise above the gate is left alone rather than
+trimmed to nothing.
 
 `rip_split` cuts a finished side at its silences — gaps at least 1.5 s long and 18 dB below
 the side's own loud level — into `<name>-01.flac`, `<name>-02.flac`, … with a stream copy. The
@@ -309,8 +319,8 @@ installation.
   a ~30 s level history (green once a chunk is above the gate), the gate and the measured
   room floor, whether audio is above the gate, how many lookups Shazam has refused, how long
   ago the last lookup was and what it answered.
-- **Rip** — state, elapsed time, peak level and the file being written, whether auto-rip is
-  armed (and holding after a hand stop), what the last gain calibration did, a Start/Stop
+- **Rip** — state, elapsed time, peak level and the file being written, whether auto start and auto stop
+  are on (and holding after a hand stop), what the last gain calibration did, a Start/Stop
   button and a **Set the gain** button that do exactly what the MQTT switch does, and the
   finished recordings in `rip_dir` with their sizes. Each can be played, downloaded or
   deleted. Files are addressed by name and only inside `rip_dir`, so nothing else on the disk

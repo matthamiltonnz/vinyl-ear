@@ -45,12 +45,14 @@ RIP_SETTING_FIELDS = (
     "rip_dir",
     "rip_format",
     "rip_max_minutes",
-    "rip_auto",
+    "rip_auto_start",
+    "rip_auto_stop",
+    "rip_trim",
     "rip_auto_gain",
     "rip_auto_stop_seconds",
     "rip_split",
 )
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -109,6 +111,9 @@ TRACK_GAP_DEPTH_DB = 18.0
 TRACK_GAP_SECONDS = 1.5
 TRACK_MIN_SECONDS = 10.0
 TRACK_MAX_COUNT = 24
+# How much of the lead-in to keep when trimming a hand-started side: enough that the needle
+# drop and the first groove are still there, without minutes of run-in before the music.
+TRIM_LEAD_SECONDS = 0.5
 # Streaming: one ffmpeg turns the live PCM into MP3, and every listener gets the same bytes
 # with ICY metadata blocks mixed in every STREAM_METAINT bytes of audio.
 STREAM_PORT = 8098
@@ -170,7 +175,9 @@ class Config:
     rip_dir: str
     rip_format: str
     rip_max_minutes: int
-    rip_auto: bool = False
+    rip_auto_start: bool = False
+    rip_auto_stop: bool = True
+    rip_trim: bool = True
     rip_auto_gain: bool = False
     rip_auto_stop_seconds: int = 20
     rip_split: bool = False
@@ -210,7 +217,9 @@ def load_config() -> Config:
         rip_dir=str(raw.get("rip_dir") or "/share/vinyl-rips").strip(),
         rip_format=str(raw.get("rip_format") or "flac").strip().lower(),
         rip_max_minutes=int(raw.get("rip_max_minutes", 30)),
-        rip_auto=bool(raw.get("rip_auto", False)),
+        rip_auto_start=bool(raw.get("rip_auto_start", raw.get("rip_auto", False))),
+        rip_auto_stop=bool(raw.get("rip_auto_stop", raw.get("rip_auto", True))),
+        rip_trim=bool(raw.get("rip_trim", True)),
         rip_auto_gain=bool(raw.get("rip_auto_gain", False)),
         rip_auto_stop_seconds=int(raw.get("rip_auto_stop_seconds", 20)),
         rip_split=bool(raw.get("rip_split", False)),
@@ -231,7 +240,7 @@ def check_rip_settings(changes: dict[str, Any]) -> tuple[dict[str, Any], str]:
     for name, value in changes.items():
         if name not in RIP_SETTING_FIELDS:
             continue  # not ours to change
-        if name in {"rip_auto", "rip_auto_gain", "rip_split"}:
+        if name in {"rip_auto_start", "rip_auto_stop", "rip_auto_gain", "rip_trim", "rip_split"}:
             if not isinstance(value, bool):
                 return {}, "%s must be true or false" % name
             clean[name] = value
@@ -305,6 +314,10 @@ def load_rip_settings(cfg: Config) -> None:
         if error:
             log.warning("Ignoring saved rip settings: %s", error)
             return
+        if "rip_auto" in saved and "rip_auto_start" not in saved:
+            # 0.10.x had one switch for both halves; keep what it meant.
+            clean["rip_auto_start"] = bool(saved["rip_auto"])
+            clean.setdefault("rip_auto_stop", bool(saved["rip_auto"]))
         for name, value in clean.items():
             setattr(cfg, name, value)
         log.info("Rip settings: %s", rip_settings(cfg))
@@ -1077,6 +1090,78 @@ def split_rip(path: Path, cuts: list[float], duration: float) -> list[Path]:
     return created
 
 
+def loud_window(levels: list[float], chunk_seconds: float) -> tuple[int, int] | None:
+    """The first and last chunk of a side that carry music, or None when there is none."""
+    if len(levels) < 3 or chunk_seconds <= 0:
+        return None
+    ordered = sorted(levels)
+    loud = ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))]
+    floor = loud - TRACK_GAP_DEPTH_DB
+    first = next((index for index, level in enumerate(levels) if level > floor), None)
+    last = next(
+        (index for index in range(len(levels) - 1, -1, -1) if levels[index] > floor), None
+    )
+    if first is None or last is None:
+        return None
+    return first, last
+
+
+def trim_rip(
+    path: Path, levels: list[float], chunk_seconds: float, duration: float
+) -> tuple[float, float] | None:
+    """Cut the run-in and run-out silence off a finished side, in place.
+
+    Returns the (start, end) window that was kept, or None when there was nothing worth
+    cutting. The file is re-cut with a stream copy, so this is quick and lossless.
+    """
+    window = loud_window(levels, chunk_seconds)
+    if window is None:
+        return None
+    first, last = window
+    start = max(0.0, first * chunk_seconds - TRIM_LEAD_SECONDS)
+    end = min(duration, (last + 1) * chunk_seconds + TRIM_LEAD_SECONDS)
+    if start < 0.5 and end > duration - 0.5:
+        return None
+    temporary = path.with_name(path.stem + "-trimmed" + path.suffix)
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-y",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{start:.3f}",
+                "-to",
+                f"{end:.3f}",
+                "-i",
+                str(path),
+                # A stream copy of a WAV is sample accurate and keeps the header honest. A
+                # FLAC copy does not: STREAMINFO carries the *original* total sample count, so
+                # the cut file still claims the whole side (44 s of audio in an 11 s file).
+                # Re-encoding FLAC is lossless, so that is what gets used.
+                *(["-c", "copy"] if path.suffix.lower() == ".wav" else ["-c:a", "flac"]),
+                str(temporary),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as err:
+        log.warning("Could not trim %s (%s)", path.name, err)
+        return None
+    if result.returncode != 0 or not temporary.exists():
+        log.warning("Could not trim %s (%s)", path.name, (result.stderr or "").strip()[:200])
+        return None
+    try:
+        os.replace(temporary, path)
+    except OSError as err:
+        log.warning("Could not replace %s after trimming (%s)", path.name, err)
+        return None
+    return start, end
+
+
 class RipRecorder:
     """Capture every chunk to disk, in the source's own channel count and rate.
 
@@ -1335,13 +1420,38 @@ async def rip_worker(
             peak,
             ", CLIPPED - lower the capture gain" if clipped else "",
         )
+        if cfg.rip_trim:
+            trimmed = await asyncio.to_thread(
+                trim_rip, path, levels, chunk_seconds, seconds
+            )
+            if trimmed is not None:
+                start, end = trimmed
+                note(
+                    status,
+                    "Trimmed %.1fs of silence from %s (kept %.0fs)"
+                    % (seconds - (end - start), path.name, end - start),
+                )
+                keep_from = int(start / chunk_seconds) if chunk_seconds else 0
+                keep_to = int(end / chunk_seconds) + 1 if chunk_seconds else len(levels)
+                levels = levels[keep_from:keep_to]
+                original, seconds = start, end - start
+                # The file is shorter now, so the reported length must follow it or the page
+                # and the retained payload keep advertising the untrimmed side.
+                recorder.frames = int(round(seconds * cfg.sample_rate))
+                report(retain=True)
+            else:
+                original = 0.0
+        else:
+            original = 0.0
         if not cfg.rip_split:
             return
         cuts = find_track_gaps(levels, chunk_seconds, seconds)
         if not cuts:
             note(status, "No track gaps found in %s — left it whole" % path.name)
             return
-        created = await asyncio.to_thread(split_rip, path, cuts, seconds)
+        created = await asyncio.to_thread(
+            split_rip, path, [cut + original for cut in cuts], seconds
+        )
         if created:
             note(
                 status,
@@ -1478,7 +1588,11 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         "track": None,
         "events": [],
         "gain": None,
-        "auto": {"enabled": cfg.rip_auto, "holding": False},
+        "auto": {
+            "start": cfg.rip_auto_start,
+            "stop": cfg.rip_auto_stop,
+            "holding": False,
+        },
         "stream": {
             "enabled": cfg.stream_enabled,
             "clients": 0,
@@ -1513,7 +1627,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     # while the same side is still playing, and the guard keeps the command queue quiet.
     was_recording = False
     auto_hold = False
-    auto_owned = False
+    rip_heard_music = False
     last_auto_command = 0.0
     # When the current uninterrupted stretch of sound began. Learning a floor while a
     # record is playing must not count the time since the add-on started as "nothing has
@@ -1655,28 +1769,29 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 elif len(clip) < listen_bytes * 3:
                     clip.extend(data)
 
-            # Auto-rip: start on the needle drop, stop when the side has run out. The
-            # worker does the recording; this only decides when to ask it to.
             recording = status["rip"].get("state") == "recording"
             quiet_for = (now - last_loud_at) if last_loud_at is not None else math.inf
-            if cfg.rip_auto:
-                if recording and auto_owned:
-                    if quiet_for >= cfg.rip_auto_stop_seconds:
-                        commands.put_nowait("OFF")
-                        last_auto_command = now
-                        auto_owned = False
-                        note(
-                            status,
-                            "Auto-rip: quiet for %ds — stopping"
-                            % cfg.rip_auto_stop_seconds,
-                        )
-                elif recording:
-                    # Started from the switch or the page: not ours to stop.
+            # A rip that has just ended forgets that it heard music; until then the flag also
+            # covers an `AUTO` start, whose music arrived before the worker was recording.
+            stopped = was_recording and not recording
+            # Auto-rip has two halves that are separate settings: starting on its own when
+            # a record appears, and stopping when the side runs out. A hand-started rip is
+            # always stopped by the second one, but only after it has actually heard music,
+            # so a long wait before dropping the needle is not mistaken for an ending.
+            if cfg.rip_auto_stop and recording and rip_heard_music:
+                if quiet_for >= cfg.rip_auto_stop_seconds:
+                    commands.put_nowait("OFF")
+                    last_auto_command = now
+                    note(
+                        status,
+                        "Auto-rip: quiet for %ds — stopping" % cfg.rip_auto_stop_seconds,
+                    )
+            if cfg.rip_auto_start:
+                if recording:
                     auto_hold = False
-                elif was_recording and auto_owned:
-                    # Our rip ended while the input was still loud — a hand stop, or the
-                    # time limit. Do not spring back up until the side has actually ended.
-                    auto_owned = False
+                elif was_recording:
+                    # It ended while the record was still playing (a hand stop, or the time
+                    # limit): do not spring back up until the side has really finished.
                     if quiet_for < cfg.rip_auto_stop_seconds:
                         auto_hold = True
                         note(
@@ -1694,10 +1809,20 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 ):
                     commands.put_nowait("AUTO")
                     last_auto_command = now
-                    auto_owned = True
+                    # The pre-roll is what gets recorded first, so the music that caused this
+                    # start is behind us by the time the worker is recording: count it now.
+                    rip_heard_music = True
                     note(status, "Auto-rip: sound for %ds — starting" % AUTO_START_SECONDS)
+            if recording and level >= threshold:
+                rip_heard_music = True
+            if stopped:
+                rip_heard_music = False
             was_recording = recording
-            status["auto"] = {"enabled": cfg.rip_auto, "holding": auto_hold}
+            status["auto"] = {
+                "start": cfg.rip_auto_start,
+                "stop": cfg.rip_auto_stop,
+                "holding": auto_hold,
+            }
 
             prebuffer.extend(data)
             if len(prebuffer) > prebuffer_bytes:
@@ -1932,11 +2057,15 @@ INDEX_HTML = (
     <div class="row"><span>stop after (min)</span><span>
       <input id="setMax" type="number" min="1" max="180" class="small">
     </span></div>
-    <div class="row"><span>auto-rip</span><span>
-      <input id="setAuto" type="checkbox"> after
+    <div class="row"><span>auto start</span><span>
+      <input id="setAutoStart" type="checkbox"> when a record starts playing
+    </span></div>
+    <div class="row"><span>auto stop</span><span>
+      <input id="setAutoStop" type="checkbox"> after
       <input id="setStop" type="number" min="5" max="120" class="small"> s quiet
     </span></div>
     <div class="row"><span>auto gain</span><span><input id="setGain" type="checkbox"></span></div>
+    <div class="row"><span>trim silence</span><span><input id="setTrim" type="checkbox"> cut the run-in and run-out</span></div>
     <div class="row"><span>split tracks</span><span><input id="setSplit" type="checkbox"></span></div>
     <p class="buttons">
       <button id="saveSettings">Save settings</button>
@@ -2037,9 +2166,12 @@ function renderRip(status) {
     : db(gain.measured_dbfs) + " peak → " + (gain.volume ?? "?") + "%"
       + (gain.change_db ? " (" + (gain.change_db > 0 ? "+" : "") + gain.change_db + " dB)" : "");
   const auto = status.auto || {};
-  $("auto").textContent = !auto.enabled
-    ? "off"
-    : (auto.holding ? "armed, holding (stopped by hand)" : "armed");
+  const autoParts = [];
+  if (auto.start) autoParts.push("starts on music");
+  if (auto.stop) autoParts.push("stops after quiet");
+  if (!autoParts.length) autoParts.push("off");
+  if (auto.holding) autoParts.push("holding (stopped by hand)");
+  $("auto").textContent = autoParts.join(", ");
   const button = $("ripButton");
   button.textContent = recording ? "Stop the rip" : "Start a rip";
   button.className = recording ? "stop" : "";
@@ -2087,9 +2219,11 @@ function renderSettings(settings) {
   $("setFormat").value = settings.rip_format || "flac";
   $("setDir").value = settings.rip_dir || "";
   $("setMax").value = settings.rip_max_minutes ?? 30;
-  $("setAuto").checked = !!settings.rip_auto;
+  $("setAutoStart").checked = !!settings.rip_auto_start;
+  $("setAutoStop").checked = !!settings.rip_auto_stop;
   $("setStop").value = settings.rip_auto_stop_seconds ?? 20;
   $("setGain").checked = !!settings.rip_auto_gain;
+  $("setTrim").checked = !!settings.rip_trim;
   $("setSplit").checked = !!settings.rip_split;
 }
 
@@ -2098,9 +2232,11 @@ function settingsPayload() {
     rip_format: $("setFormat").value,
     rip_dir: $("setDir").value.trim(),
     rip_max_minutes: Number($("setMax").value),
-    rip_auto: $("setAuto").checked,
+    rip_auto_start: $("setAutoStart").checked,
+    rip_auto_stop: $("setAutoStop").checked,
     rip_auto_stop_seconds: Number($("setStop").value),
     rip_auto_gain: $("setGain").checked,
+    rip_trim: $("setTrim").checked,
     rip_split: $("setSplit").checked,
   };
 }
@@ -2125,7 +2261,7 @@ async function saveSettings() {
   $("saveSettings").disabled = false;
 }
 
-for (const id of ["setFormat", "setDir", "setMax", "setAuto", "setStop", "setGain", "setSplit"]) {
+for (const id of ["setFormat", "setDir", "setMax", "setAutoStart", "setAutoStop", "setStop", "setGain", "setTrim", "setSplit"]) {
   $(id).addEventListener("input", () => {
     settingsDirty = true;
     $("settingsHint").textContent = "unsaved changes";
