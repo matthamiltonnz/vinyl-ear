@@ -268,6 +268,16 @@ the storage files under `/config/.storage` instead.
    have shipped a three-release-old listener. Check `sudo grep '^version' /addons/vinyl_ear/config.yaml`
    and `sudo md5sum /addons/vinyl_ear/app/main.py` against the repo before claiming a release,
    and `sudo ls /addons/vinyl_ear` for a stale nested `vinyl_ear/` left by the old command.
+   That nested copy is not merely clutter: it is a **second add-on with the same slug**, the
+   supervisor picks it up, and every Rebuild then builds *it* — the symptom is
+   `Starting build for local/amd64-addon-vinyl_ear:0.6.4` in `docker logs hassio_supervisor`
+   while `/addons/vinyl_ear/config.yaml` says 0.7.0, no new image tag, and the Add-on page
+   showing "no update". Nothing in the UI fixes that; delete the nested folder (keep
+   `config.yaml Dockerfile requirements.txt run.sh app/` and nothing else), then nudge the
+   supervisor, because it caches add-on metadata across restarts: `POST /addons/reload` and
+   then `POST /addons/<slug>/update` through `http://supervisor` with the **Home Assistant
+   container's** `SUPERVISOR_TOKEN` (`docker exec homeassistant python -` with a script on
+   stdin). `curl`ing it from the SSH add-on will not work — its token only reaches core.
 4. Commit and push to https://github.com/matthamiltonnz/vinyl-ear (public — check the
    diff for anything installation specific first, see below).
 5. The user presses **Rebuild** on the add-on page; Lovelace changes land through an HA
