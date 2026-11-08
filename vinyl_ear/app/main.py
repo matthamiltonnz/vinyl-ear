@@ -38,7 +38,19 @@ ARTWORK_DIR = Path("/config/www/vinyl-art")
 # How many epoch-named covers to keep beside the fixed `device_name.jpg`.
 ARTWORK_KEEP = 5
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.9.1"
+# The rip options live in the web interface, so they need a home the add-on owns: the
+# add-on's own options are only written by the supervisor, and only at a restart.
+RIP_SETTINGS_FILE = Path("/data/rip-settings.json")
+RIP_SETTING_FIELDS = (
+    "rip_dir",
+    "rip_format",
+    "rip_max_minutes",
+    "rip_auto",
+    "rip_auto_gain",
+    "rip_auto_stop_seconds",
+    "rip_split",
+)
+VERSION = "0.10.0"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -131,8 +143,14 @@ class GateUnavailable(RuntimeError):
     """The supervisor will not let this add-on read Home Assistant states."""
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class Config:
+    """Everything the add-on was configured with.
+
+    Not frozen on purpose: the rip options are changed from the web UI while it runs, and
+    every task holds this same object, so a changed field is seen by the next decision
+    without restarting anything.
+    """
     source: str
     active_entity: str
     sample_rate: int
@@ -200,6 +218,100 @@ def load_config() -> Config:
         stream_bitrate=int(raw.get("stream_bitrate", 128)),
         stream_format=str(raw.get("stream_format") or "mp3"),
     )
+
+
+def rip_settings(cfg: Config) -> dict[str, Any]:
+    """The rip options as plain data: what the web UI shows and the settings file holds."""
+    return {name: getattr(cfg, name) for name in RIP_SETTING_FIELDS}
+
+
+def check_rip_settings(changes: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Validate a partial update; returns (clean values, error message or "")."""
+    clean: dict[str, Any] = {}
+    for name, value in changes.items():
+        if name not in RIP_SETTING_FIELDS:
+            continue  # not ours to change
+        if name in {"rip_auto", "rip_auto_gain", "rip_split"}:
+            if not isinstance(value, bool):
+                return {}, "%s must be true or false" % name
+            clean[name] = value
+        elif name == "rip_format":
+            text = str(value).lower()
+            if text not in {"flac", "wav"}:
+                return {}, "format must be flac or wav"
+            clean[name] = text
+        elif name in {"rip_max_minutes", "rip_auto_stop_seconds"}:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                return {}, "%s must be a whole number" % name.replace("rip_", "")
+            low, high = (1, 180) if name == "rip_max_minutes" else (5, 120)
+            if not low <= number <= high:
+                return (
+                    {},
+                    "%s must be between %d and %d"
+                    % (name.replace("rip_", "").replace("_", " "), low, high),
+                )
+            clean[name] = number
+        elif name == "rip_dir":
+            text = str(value or "").strip()
+            if not text:
+                return {}, "the rip folder cannot be empty"
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                return {}, "the rip folder must be an absolute path, like /share/vinyl-rips"
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                probe = path / ".vinyl-ear-write-test"
+                probe.write_text("ok")
+                probe.unlink()
+            except OSError as err:
+                return {}, "cannot write to %s (%s)" % (path, err)
+            clean[name] = str(path)
+    return clean, ""
+
+
+def apply_rip_settings(
+    cfg: Config, values: dict[str, Any], status: dict[str, Any] | None = None
+) -> None:
+    """Use new rip settings straight away and remember them; no restart is involved."""
+    for name, value in values.items():
+        setattr(cfg, name, value)
+    try:
+        RIP_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RIP_SETTINGS_FILE.write_text(json.dumps(rip_settings(cfg), indent=1, sort_keys=True))
+    except OSError as err:
+        log.warning("Could not save the rip settings (%s)", err)
+        if status is not None:
+            note(status, "Rip settings applied but not saved (%s)" % err)
+        return
+    log.info("Rip settings updated: %s", values)
+    if status is not None:
+        note(
+            status,
+            "Rip settings updated: %s" % ", ".join("%s=%s" % item for item in values.items()),
+        )
+
+
+def load_rip_settings(cfg: Config) -> None:
+    """Overlay the saved rip settings on the add-on options, seeding the file on first run."""
+    if RIP_SETTINGS_FILE.is_file():
+        try:
+            saved = json.loads(RIP_SETTINGS_FILE.read_text())
+        except (OSError, ValueError) as err:
+            log.warning("Ignoring unreadable %s (%s)", RIP_SETTINGS_FILE, err)
+            return
+        clean, error = check_rip_settings(saved)
+        if error:
+            log.warning("Ignoring saved rip settings: %s", error)
+            return
+        for name, value in clean.items():
+            setattr(cfg, name, value)
+        log.info("Rip settings: %s", rip_settings(cfg))
+        return
+    # First start on this version: until now the add-on options were the settings, so keep
+    # whatever they say by writing them into the file that is now the source of truth.
+    apply_rip_settings(cfg, rip_settings(cfg))
 
 
 def rms_to_dbfs(rms: float) -> float:
@@ -980,6 +1092,9 @@ class RipRecorder:
         self.frames = 0
         self.peak = 0
         self.file: Path | None = None
+        # Snapshot of the format at start, so changing the setting mid-side cannot change
+        # what this side is encoded as.
+        self.format = cfg.rip_format
         # One peak dBFS per chunk, in order: the timeline `find_track_gaps()` splits on.
         self.levels: list[float] = []
         self.chunk_seconds = 0.0
@@ -995,6 +1110,7 @@ class RipRecorder:
         return rms_to_dbfs(self.peak)
 
     def start(self) -> None:
+        self.format = self.cfg.rip_format  # the setting as it is *now*, not last time
         directory = Path(self.cfg.rip_dir).expanduser()
         directory.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -1039,7 +1155,7 @@ class RipRecorder:
             return None
         handle.close()
         self.file = source
-        if self.cfg.rip_format == "flac":
+        if self.format == "flac":
             target = source.with_suffix(".flac")
             result = subprocess.run(
                 [
@@ -1109,7 +1225,7 @@ async def rip_worker(
             "clipped": recorder.peak >= 32767,
             "channels": channels,
             "sample_rate": cfg.sample_rate,
-            "format": cfg.rip_format,
+            "format": recorder.format,
         }
         status["rip"] = payload
         publish(client, state_topic, "ON" if recorder.recording else "OFF", retain=retain)
@@ -1179,7 +1295,7 @@ async def rip_worker(
                 recorder.wav_path.name,
                 channels,
                 cfg.sample_rate,
-                cfg.rip_format,
+                recorder.format,
                 ", %.0fs of pre-roll" % (carried / cfg.bytes_per_second(channels))
                 if carried
                 else "",
@@ -1190,7 +1306,7 @@ async def rip_worker(
             recorder.wav_path,
             channels,
             cfg.sample_rate,
-            cfg.rip_format,
+            recorder.format,
         )
         if channels == 1:
             log.warning(
@@ -1740,6 +1856,10 @@ INDEX_HTML = (
            background: #2b6cb0; color: #fff; }
   button.stop { background: #b02b2b; }
   button.quiet { background: #37474f; }
+  input, select { background: #0b0e13; color: #e7eaf0; border: 1px solid #2a3446;
+                  border-radius: 7px; padding: 3px 6px; font: inherit; font-size: .85rem; }
+  input.small { width: 64px; }
+  input[type="checkbox"] { width: auto; }
   .buttons { display: flex; gap: 10px; flex-wrap: wrap; }
   button:disabled { opacity: .45; cursor: default; }
   table { width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: 12px; }
@@ -1802,6 +1922,26 @@ INDEX_HTML = (
       <thead><tr><th>recording</th><th>size</th><th></th></tr></thead>
       <tbody id="files"><tr><td colspan="3" class="muted">no rips yet</td></tr></tbody>
     </table>
+  </section>
+  <section>
+    <h2>Rip settings</h2>
+    <div class="row"><span>format</span><span>
+      <select id="setFormat"><option value="flac">flac</option><option value="wav">wav</option></select>
+    </span></div>
+    <div class="row"><span>folder</span><span><input id="setDir" size="16" spellcheck="false"></span></div>
+    <div class="row"><span>stop after (min)</span><span>
+      <input id="setMax" type="number" min="1" max="180" class="small">
+    </span></div>
+    <div class="row"><span>auto-rip</span><span>
+      <input id="setAuto" type="checkbox"> after
+      <input id="setStop" type="number" min="5" max="120" class="small"> s quiet
+    </span></div>
+    <div class="row"><span>auto gain</span><span><input id="setGain" type="checkbox"></span></div>
+    <div class="row"><span>split tracks</span><span><input id="setSplit" type="checkbox"></span></div>
+    <p class="buttons">
+      <button id="saveSettings">Save settings</button>
+      <span class="muted" id="settingsHint">applies immediately, no restart</span>
+    </p>
   </section>
   <section>
     <h2>Radio stream</h2>
@@ -1940,6 +2080,64 @@ function renderRip(status) {
   $("files").replaceChildren(...rows);
 }
 
+let settingsDirty = false;
+
+function renderSettings(settings) {
+  if (!settings || settingsDirty) return;   // never stomp on what is being edited
+  $("setFormat").value = settings.rip_format || "flac";
+  $("setDir").value = settings.rip_dir || "";
+  $("setMax").value = settings.rip_max_minutes ?? 30;
+  $("setAuto").checked = !!settings.rip_auto;
+  $("setStop").value = settings.rip_auto_stop_seconds ?? 20;
+  $("setGain").checked = !!settings.rip_auto_gain;
+  $("setSplit").checked = !!settings.rip_split;
+}
+
+function settingsPayload() {
+  return {
+    rip_format: $("setFormat").value,
+    rip_dir: $("setDir").value.trim(),
+    rip_max_minutes: Number($("setMax").value),
+    rip_auto: $("setAuto").checked,
+    rip_auto_stop_seconds: Number($("setStop").value),
+    rip_auto_gain: $("setGain").checked,
+    rip_split: $("setSplit").checked,
+  };
+}
+
+async function saveSettings() {
+  $("saveSettings").disabled = true;
+  $("settingsHint").textContent = "saving…";
+  try {
+    const response = await fetch("api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settingsPayload()),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || "HTTP " + response.status);
+    settingsDirty = false;
+    $("settingsHint").textContent = "saved";
+    refresh();
+  } catch (err) {
+    $("settingsHint").textContent = "not saved: " + err.message;
+  }
+  $("saveSettings").disabled = false;
+}
+
+for (const id of ["setFormat", "setDir", "setMax", "setAuto", "setStop", "setGain", "setSplit"]) {
+  $(id).addEventListener("input", () => {
+    settingsDirty = true;
+    $("settingsHint").textContent = "unsaved changes";
+  });
+  $(id).addEventListener("change", () => {
+    settingsDirty = true;
+    $("settingsHint").textContent = "unsaved changes";
+  });
+}
+
+$("saveSettings").onclick = () => saveSettings();
+
 function renderStream(status) {
   const stream = status.stream || {};
   const format = stream.format === "flac" ? "flac" : "mp3";
@@ -1985,6 +2183,7 @@ function render(status) {
   renderRip(status);
   renderEvents(status.events);
   renderStream(status);
+  renderSettings(status.settings);
 }
 
 async function refresh() {
@@ -2104,6 +2303,7 @@ async def web_server(
         mid_rip = recording_name()
         payload["rips"] = [item for item in rips if item["name"] != mid_rip]
         payload["rip_dir"] = cfg.rip_dir
+        payload["settings"] = rip_settings(cfg)
         payload["now"] = time.time()
         looked_up = status.get("last_lookup")
         payload["last_lookup_seconds"] = (
@@ -2141,6 +2341,24 @@ async def web_server(
             headers={"Content-Disposition": f'{disposition}; filename="{path.name}"'},
         )
 
+    async def api_settings(request: web.Request) -> web.StreamResponse:
+        """Change the rip options from the page; they apply at once and are saved."""
+        try:
+            body = await request.json()
+        except (ValueError, aiohttp.ContentTypeError):
+            body = None
+        if not isinstance(body, dict):
+            return web.json_response({"error": "send a JSON object"}, status=400)
+        clean, error = check_rip_settings(body)
+        if error:
+            return web.json_response({"error": error}, status=400)
+        if not clean:
+            return web.json_response(
+                {"error": "nothing to change", "settings": rip_settings(cfg)}, status=400
+            )
+        await asyncio.to_thread(apply_rip_settings, cfg, clean, status)
+        return web.json_response({"ok": True, "settings": rip_settings(cfg)})
+
     async def api_delete(request: web.Request) -> web.StreamResponse:
         if request.match_info["name"] == recording_name():
             raise web.HTTPConflict(text="that recording is still being written")
@@ -2161,6 +2379,7 @@ async def web_server(
             web.get("/", index),
             web.get("/api/status", api_status),
             web.post("/api/rip", api_rip),
+            web.patch("/api/settings", api_settings),
             web.get("/files/{name}", api_file),
             web.delete("/files/{name}", api_delete),
         ]
@@ -2564,6 +2783,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)-8s %(message)s",
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
     )
+    load_rip_settings(cfg)
     log.info(
         "Vinyl Ear %s starting (device=%s, gate=%.0f dBFS, clip=%ss, poll=%ss)",
         VERSION,

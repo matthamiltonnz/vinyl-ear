@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.9.1**.
+what the startup banner prints). Current: **0.10.0**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -252,6 +252,11 @@ patch the storage file from those, do not hand-edit the JSON.
     being read, which stops Shazam, the gate, the auto-rip and the rip itself — the whole
     add-on freezes with no obvious symptom. Dropping audio for the stream is always the right
     trade.
+17. **A `RipRecorder` lives as long as the worker, so its settings must be read at `start()`.**
+    When the format became a live setting, snapshotting `cfg.rip_format` in `__init__` meant
+    every rip after the first kept whatever the format was when the add-on booted — the UI said
+    `wav`, the files came out `flac`. It is read in `start()` instead, so one side cannot change
+    format half way through and the next side still picks the new setting up.
 
 ## Ripping
 
@@ -262,6 +267,20 @@ lives on `vinyl_ear/<device>/rip` (progress JSON) and `.../rip/state` (`ON`/`OFF
 and the switch entity drives `.../rip/set`. `rip_max_minutes` bounds a forgotten switch.
 Files land in `rip_dir`, `/share/vinyl-rips` by default, which is why the manifest now maps
 `share:rw`.
+
+### Where the rip settings live (0.10.0)
+
+The rip knobs are **not add-on options**: they are edited in the web UI (`PATCH /api/settings`)
+and kept in `RIP_SETTINGS_FILE` (`/data/rip-settings.json`), because the supervisor only writes
+options at a restart and that is the wrong shape for a switch you flip while a record plays.
+`Config` is therefore *not* frozen — every task holds the same object and `apply_rip_settings()`
+mutates its fields, so the next decision (the auto-rip block, the next `recorder.start()`, the
+next split) sees the new value immediately; only the file write is blocking, hence the
+`asyncio.to_thread`. `load_rip_settings()` overlays the file on the options at startup and, when
+the file is missing (first run on this version), seeds it from whatever the add-on options say —
+so an upgrade keeps the settings it had. The old `rip_*` keys have been removed from
+`config.yaml`; the supervisor prunes them from `/data/options.json` (it logs a warning about an
+option outside the schema until it does).
 
 ### Auto-rip, gain and splitting (0.8.0)
 
@@ -351,7 +370,10 @@ measured floor, last lookup time and answer, the published track, the rip snapsh
 publishes to `.../rip` into `status["rip"]`, so the page agrees with Home Assistant by
 construction. The page polls `/api/status` once a second. `POST /api/rip` with
 `{"action":"start"|"stop"|"gain"}` puts `ON`/`OFF`/`GAIN` on **the same `commands` queue the
-MQTT switch uses**, so there is one worker and one code path. Recordings are served by *name* only
+MQTT switch uses**, so there is one worker and one code path. `PATCH /api/settings` changes
+the rip settings (validated in `check_rip_settings()`, applied by `apply_rip_settings()` — see
+*Where the rip settings live*), and both `/api/status` and the answer carry the settings so the
+form can be filled from the same poll. Recordings are served by *name* only
 (`GET /files/<name>`, `?download=1`, `DELETE`), resolved inside `rip_dir` with a parent
 check: there is no path parameter to traverse, and this is the add-on's only write/delete
 surface.

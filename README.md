@@ -183,18 +183,18 @@ sampled four times a second rather than in bursts:
 | `mqtt_user` / `mqtt_password` | *(empty)* | Leave empty for anonymous brokers. |
 | `discovery_prefix` | `homeassistant` | HA's MQTT discovery prefix. |
 | `log_level` | `info` | `debug` logs every capture attempt and the audio level. |
-| `rip_dir` | `/share/vinyl-rips` | Where a rip is written. `/share`, `/media` and `/config` are all writable from the add-on; `/media/vinyl-rips` also shows up in Home Assistant's Media browser. |
-| `rip_format` | `flac` | `flac` (lossless, about a third of the size) or `wav` (uncompressed). Both keep exactly what the input delivered. |
-| `rip_max_minutes` | `30` | A rip stops itself after this long, so a forgotten switch cannot fill the disk. A 12" side is 20-25 minutes. |
-| `rip_auto` | `false` | Arm the ripper: a side starts on its own three seconds after music appears and stops after `rip_auto_stop_seconds` of quiet. |
-| `rip_auto_gain` | `false` | Before an auto rip starts, move the capture gain so the record's peak lands near -6 dBFS (the pre-roll is scaled to match, so the side stays level). |
-| `rip_auto_stop_seconds` | `20` | How quiet, and for how long, counts as "the side has ended". The run-out groove makes noise, so shorter is usually worse. |
-| `rip_split` | `false` | Cut a finished side at its silences into `<name>-01`, `<name>-02`, … The whole-side file is kept. |
 | `stream_enabled` | `false` | Serve the live capture as an MP3 radio stream on port 8098, with ICY metadata, for Music Assistant. Audio only. |
 | `stream_bitrate` | `128` | The MP3 stream's bitrate in kbit/s (64-192). Ignored for FLAC. |
 | `stream_format` | `mp3` | `mp3` (128 kbit/s with ICY now-playing) or `flac` (lossless, ~700-1000 kbit/s, no in-band metadata). |
 
 ## Ripping a record
+
+Everything about ripping is set in the add-on's **web interface**, in the *Rip settings*
+panel: folder, format, the time limit, auto-rip, auto-gain and splitting. They take effect the
+moment you press **Save settings** — no restart — and are kept in `/data/rip-settings.json`, so
+they survive updates and rebuilds. They are deliberately *not* add-on options any more: those
+are written only by the supervisor, and only take effect on a restart, which is the wrong shape
+for "split tracks: on".
 
 Switch on the **Rip record** switch (MQTT discovery creates `switch.<device>_rip`) — or press
 **Start a rip** in the add-on's web interface, which is the same command — and drop
