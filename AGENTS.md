@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.9.0**.
+what the startup banner prints). Current: **0.9.1**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -242,6 +242,10 @@ patch the storage file from those, do not hand-edit the JSON.
     offsets, so the counter cannot be shared. Get this wrong and players either resync
     constantly or show no title at all; `ffprobe` on the extracted audio is what proves the
     bytes between blocks are still decodable.
+    The FLAC stream therefore carries **no** ICY at all: `icy-*` headers are only sent for
+    mp3, and the writer skips the metadata blocks entirely for FLAC. Injecting them anyway
+    would be worse than having no title — every decoder would have to resync around garbage —
+    so `/now-playing` is the metadata for that case, and the README says so.
 16. **The stream tap must not be able to stall the capture.** `audio_reader`'s `tap` awaits the
     rip queue and then *pushes* to the encoder with `put_nowait`. If the encoder is fed with a
     blocking `await`, one ffmpeg hiccup (or a full queue because ffmpeg died) stops `parec`
@@ -310,9 +314,11 @@ three places that must agree: `STREAM_PORT`, the `ports:`/`ports_description:` e
 the URL the page prints (`location.hostname` + `:8098`).
 
 - One ffmpeg per *listening session*: `-f s16le -ar <rate> -ac <channels> -i pipe:0` →
-  `libmp3lame -b:a <stream_bitrate>k` → `pipe:1`. It starts on the first connection and is
-  stopped by a reaper after `STREAM_IDLE_STOP_SECONDS` with nobody attached, so an armed but
-  unlistened stream costs nothing.
+  `codec_args()` → `pipe:1`. `stream_format` picks the codec: `mp3` is
+  `libmp3lame -b:a <stream_bitrate>k`, `flac` is `flac -compression_level 5` (lossless, and
+  `stream_bitrate` is ignored). It starts on the first connection and is stopped by a reaper
+  after `STREAM_IDLE_STOP_SECONDS` with nobody attached, so an armed but unlistened stream
+  costs nothing.
 - PCM reaches it through the same `tap` the rip uses, but with `push()` — `put_nowait` into a
   `STREAM_QUEUE_CHUNKS` queue that silently drops when full. The capture is shared with Shazam
   and the rip; a slow encoder must never be able to stall it.
@@ -324,6 +330,9 @@ the URL the page prints (`location.hostname` + `:8098`).
   an `icy_block()` follows — `StreamTitle='Artist - Title';`, zero padded, length in 16-byte
   groups. The title is read from `status["track"]` at that moment, so a newly named track
   appears in the next block without any plumbing between `commit()` and the server.
+- Both `/stream.mp3` and `/stream.flac` are routed to the same handler, which redirects a
+  request for the format that is *not* configured — so a URL pasted into Music Assistant
+  months ago still works after a format change.
 - The extra endpoints are for humans and for checking: `/` (a text summary), `/stream.m3u`,
   `/now-playing` (JSON). Nothing on this port changes any state.
 
@@ -442,7 +451,10 @@ that many 16-byte groups. Strip those groups and `ffprobe` what is left — it m
 44100 2ch` — and changing `status["track"]` must change the next block's `StreamTitle`. Two
 traps: a listener that closes is only noticed on the next write, so poll `encoder.clients`
 instead of asserting immediately after the response context exits; and `push()` drops silently
-while ffmpeg is not running, so feed *after* the first connection rather than before it.
+while ffmpeg is not running, so feed *after* the first connection rather than before it. Run
+the same scenario twice with `stream_format` at `mp3` and `flac`: the FLAC pass must have no
+`icy-metaint` header at all, and `ffprobe` on the captured bytes must say `codec_name=flac`.
+`codec_args()` and the `format`/`content_type` properties can be checked without any audio.
 
 ## Release checklist
 

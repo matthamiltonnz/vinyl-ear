@@ -38,7 +38,7 @@ ARTWORK_DIR = Path("/config/www/vinyl-art")
 # How many epoch-named covers to keep beside the fixed `device_name.jpg`.
 ARTWORK_KEEP = 5
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -108,6 +108,8 @@ STREAM_QUEUE_CHUNKS = 40
 # running before its ffmpeg is stopped.
 STREAM_BUFFER_BYTES = 512 * 1024
 STREAM_IDLE_STOP_SECONDS = 15.0
+# FLAC compression level for the lossless stream: 5 is a good CPU/size balance at 44.1 kHz.
+STREAM_FLAC_LEVEL = 5
 # The web UI is served on this port and reached through Home Assistant ingress (see
 # `ingress_port` in config.yaml); it is never published to the LAN.
 WEB_PORT = 8099
@@ -156,6 +158,7 @@ class Config:
     rip_split: bool = False
     stream_enabled: bool = False
     stream_bitrate: int = 128
+    stream_format: str = "mp3"
 
     def bytes_per_second(self, channels: int = 1) -> int:
         return self.sample_rate * 2 * channels  # signed 16-bit little endian
@@ -195,6 +198,7 @@ def load_config() -> Config:
         rip_split=bool(raw.get("rip_split", False)),
         stream_enabled=bool(raw.get("stream_enabled", False)),
         stream_bitrate=int(raw.get("stream_bitrate", 128)),
+        stream_format=str(raw.get("stream_format") or "mp3"),
     )
 
 
@@ -1363,6 +1367,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             "enabled": cfg.stream_enabled,
             "clients": 0,
             "bitrate": cfg.stream_bitrate,
+            "format": "flac" if cfg.stream_format == "flac" else "mp3",
             "running": False,
         },
         "rip": {"state": "idle", "file": "", "seconds": 0, "peak_dbfs": -120,
@@ -1937,15 +1942,16 @@ function renderRip(status) {
 
 function renderStream(status) {
   const stream = status.stream || {};
+  const format = stream.format === "flac" ? "flac" : "mp3";
   $("streamState").textContent = !stream.enabled
     ? "off — set stream_enabled in the add-on options"
     : (stream.running ? "live" : "ready — starts when a listener arrives");
   $("streamClients").textContent = String(stream.clients || 0);
-  $("streamBitrate").textContent = stream.enabled
-    ? (stream.bitrate || 128) + " kbit/s MP3"
-    : "—";
+  $("streamBitrate").textContent = !stream.enabled
+    ? "—"
+    : (format === "flac" ? "lossless FLAC" : (stream.bitrate || 128) + " kbit/s MP3");
   $("streamUrl").textContent = stream.enabled
-    ? "http://" + location.hostname + ":8098/stream.mp3"
+    ? "http://" + location.hostname + ":8098/stream." + format
     : "—";
 }
 
@@ -2252,6 +2258,35 @@ class StreamEncoder:
     def running(self) -> bool:
         return self.process is not None and self.process.returncode is None
 
+    @property
+    def format(self) -> str:
+        """The stream's format: `mp3` (with ICY metadata) or `flac` (lossless, no ICY)."""
+        return "flac" if str(self.cfg.stream_format).lower() == "flac" else "mp3"
+
+    @property
+    def content_type(self) -> str:
+        return "audio/flac" if self.format == "flac" else "audio/mpeg"
+
+    def codec_args(self) -> list[str]:
+        """The output half of the ffmpeg command."""
+        if self.format == "flac":
+            return [
+                "-c:a",
+                "flac",
+                "-compression_level",
+                str(STREAM_FLAC_LEVEL),
+                "-f",
+                "flac",
+            ]
+        return [
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            f"{self.cfg.stream_bitrate}k",
+            "-f",
+            "mp3",
+        ]
+
     async def start(self) -> None:
         async with self._lock:
             if self.running:
@@ -2270,12 +2305,7 @@ class StreamEncoder:
                 str(self.channels),
                 "-i",
                 "pipe:0",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                f"{self.cfg.stream_bitrate}k",
-                "-f",
-                "mp3",
+                *self.codec_args(),
                 "pipe:1",
             ]
             try:
@@ -2366,9 +2396,14 @@ async def stream_server(
     """
 
     async def index(_request: web.Request) -> web.StreamResponse:
+        quality = (
+            "lossless FLAC"
+            if encoder.format == "flac"
+            else "%d kbit/s MP3" % cfg.stream_bitrate
+        )
         lines = [
-            "Vinyl Ear — %d kbit/s MP3" % cfg.stream_bitrate,
-            "stream:    /stream.mp3",
+            "Vinyl Ear — %s" % quality,
+            "stream:    /stream.%s" % encoder.format,
             "playlist:  /stream.m3u",
             "now:       /now-playing",
             "playing:   %s" % (icy_title(status.get("track")) or "nothing named yet"),
@@ -2376,7 +2411,9 @@ async def stream_server(
         return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
     async def playlist(_request: web.Request) -> web.StreamResponse:
-        return web.Response(text="#EXTM3U\nstream.mp3\n", content_type="audio/x-mpegurl")
+        return web.Response(
+            text="#EXTM3U\nstream.%s\n" % encoder.format, content_type="audio/x-mpegurl"
+        )
 
     async def now_playing(_request: web.Request) -> web.StreamResponse:
         return web.json_response(
@@ -2384,23 +2421,34 @@ async def stream_server(
                 "title": icy_title(status.get("track")),
                 "track": status.get("track"),
                 "listeners": encoder.clients,
+                "format": encoder.format,
+                "bitrate": None if encoder.format == "flac" else cfg.stream_bitrate,
             }
         )
 
     async def stream(request: web.Request) -> web.StreamResponse:
+        wanted = request.path.rsplit(".", 1)[-1].lower()
+        if wanted in {"mp3", "flac"} and wanted != encoder.format:
+            # One extension per format: send the player where the audio actually is.
+            raise web.HTTPFound("/stream.%s" % encoder.format)
         await encoder.start()
-        response = web.StreamResponse(
-            headers={
-                "Content-Type": "audio/mpeg",
-                "icy-name": "Vinyl Ear",
-                "icy-genre": "Vinyl",
-                "icy-br": str(cfg.stream_bitrate),
-                "icy-metaint": str(STREAM_METAINT),
-                "icy-pub": "0",
-                "Cache-Control": "no-cache, no-store",
-                "Connection": "keep-alive",
-            }
-        )
+        headers = {
+            "Content-Type": encoder.content_type,
+            "Cache-Control": "no-cache, no-store",
+            "Connection": "keep-alive",
+        }
+        if encoder.format == "mp3":
+            # ICY is an MP3/AAC convention: a raw FLAC stream has nowhere to put it.
+            headers.update(
+                {
+                    "icy-name": "Vinyl Ear",
+                    "icy-genre": "Vinyl",
+                    "icy-br": str(cfg.stream_bitrate),
+                    "icy-metaint": str(STREAM_METAINT),
+                    "icy-pub": "0",
+                }
+            )
+        response = web.StreamResponse(headers=headers)
         await response.prepare(request)
         encoder.clients += 1
         encoder.idle_since = None
@@ -2424,6 +2472,11 @@ async def stream_server(
                     if not encoder.running:
                         log.info("Stream encoder stopped; closing the listener")
                         break
+                    continue
+                if encoder.format != "mp3":
+                    # A raw FLAC stream has nowhere to put ICY metadata: send the frames on.
+                    await response.write(data)
+                    sent += len(data)
                     continue
                 view = memoryview(data)
                 while view:
@@ -2451,6 +2504,7 @@ async def stream_server(
                 "enabled": True,
                 "clients": encoder.clients,
                 "bitrate": cfg.stream_bitrate,
+                "format": encoder.format,
                 "running": encoder.running,
             }
             if encoder.clients > 0:
@@ -2467,6 +2521,7 @@ async def stream_server(
         [
             web.get("/", index),
             web.get("/stream.mp3", stream),
+            web.get("/stream.flac", stream),
             web.get("/stream.m3u", playlist),
             web.get("/now-playing", now_playing),
         ]
@@ -2491,6 +2546,7 @@ async def stream_server(
             "enabled": cfg.stream_enabled,
             "clients": 0,
             "bitrate": cfg.stream_bitrate,
+            "format": encoder.format,
             "running": False,
         }
         await runner.cleanup()

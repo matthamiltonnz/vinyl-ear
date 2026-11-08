@@ -191,7 +191,8 @@ sampled four times a second rather than in bursts:
 | `rip_auto_stop_seconds` | `20` | How quiet, and for how long, counts as "the side has ended". The run-out groove makes noise, so shorter is usually worse. |
 | `rip_split` | `false` | Cut a finished side at its silences into `<name>-01`, `<name>-02`, … The whole-side file is kept. |
 | `stream_enabled` | `false` | Serve the live capture as an MP3 radio stream on port 8098, with ICY metadata, for Music Assistant. Audio only. |
-| `stream_bitrate` | `128` | The stream's MP3 bitrate in kbit/s (64-192). The capture itself stays 16-bit; only the stream is lossy. |
+| `stream_bitrate` | `128` | The MP3 stream's bitrate in kbit/s (64-192). Ignored for FLAC. |
+| `stream_format` | `mp3` | `mp3` (128 kbit/s with ICY now-playing) or `flac` (lossless, ~700-1000 kbit/s, no in-band metadata). |
 
 ## Ripping a record
 
@@ -253,12 +254,13 @@ Some things decide whether the result is worth keeping:
 ## Stream it to Music Assistant
 
 Set `stream_enabled` and the add-on also serves the live capture as a radio stream — the same
-PCM the listener hears and the ripper records, encoded to MP3 by ffmpeg — so Music Assistant
-(or anything else that plays an HTTP stream) can put the turntable in the speaker group:
+PCM the listener hears and the ripper records, encoded by ffmpeg — so Music Assistant (or
+anything else that plays an HTTP stream) can put the turntable in the speaker group:
 
 ```
-http://<home-assistant>:8098/stream.mp3      # the stream
-http://<home-assistant>:8098/stream.m3u      # a playlist that points at it
+http://<home-assistant>:8098/stream.mp3      # 128 kbit/s MP3, with ICY now-playing
+http://<home-assistant>:8098/stream.flac     # lossless FLAC (after stream_format: flac)
+http://<home-assistant>:8098/stream.m3u      # a playlist that points at the active one
 http://<home-assistant>:8098/now-playing     # the ICY title, as JSON
 ```
 
@@ -271,6 +273,16 @@ The stream carries the detected track as **ICY metadata** (`icy-metaint` blocks 
 so Music Assistant's now-playing follows Shazam within a second or so, and blanks itself when
 nothing is named. That also means the metadata comes from the same answer the sensor publishes,
 not a second guess.
+
+**Lossless instead:** set `stream_format: flac` and the stream is FLAC straight from the
+capture — no lossy step at all, around 700-1000 kbit/s on a LAN, which is fine for Wi-Fi but
+worth knowing if you stream over a weak link. The catch is metadata: ICY is an MP3/AAC
+convention and a raw FLAC stream has nowhere to put a `StreamTitle`, so Music Assistant will
+show the station but not the track. The add-on does not fake it by injecting ICY blocks into
+FLAC (that corrupts the stream for every player). For now-playing **in the stream**, stay on
+`mp3`; the track is still on `/now-playing` and in Home Assistant either way. Only the
+configured format is served — the other extension redirects to the right one, so an old bookmarked
+URL keeps working.
 
 Things worth knowing:
 

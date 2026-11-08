@@ -1,5 +1,5 @@
 name: Vinyl Ear
-version: "0.9.0"
+version: "0.9.1"
 slug: vinyl_ear
 description: Listens to a microphone or line input, identifies the record that is playing with Shazam, publishes it to Home Assistant over MQTT, and can record a side losslessly for ripping
 url: https://github.com/matthamiltonnz/vinyl-ear
@@ -51,6 +51,7 @@ options:
   rip_split: false
   stream_enabled: false
   stream_bitrate: 128
+  stream_format: mp3
 schema:
   source: str?
   active_entity: str?
@@ -77,3 +78,4 @@ schema:
   rip_split: bool
   stream_enabled: bool
   stream_bitrate: list(64|96|128|160|192)
+  stream_format: list(mp3|flac)
