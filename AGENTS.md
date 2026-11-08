@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.11.3**.
+what the startup banner prints). Current: **0.11.6**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -288,7 +288,11 @@ patch the storage file from those, do not hand-edit the JSON.
     bytes, so "no chunk for 30 s" always means the source, never a quiet room. Now
     `audio_reader()` supervises `capture_stream()`: a read that times out kills the process,
     asks `pactl suspend-source <name> 0` to resume the source and reopens with a growing
-    backoff, while `run()`'s loop takes the queue with `asyncio.wait_for` and notes "No audio
+    backoff. That timeout has to be `asyncio.wait({read}, timeout=…)`, **not** `wait_for`:
+    cancelling a task that waits on `asyncio.to_thread` does not interrupt the thread, and
+    `wait_for` awaits that cancellation, so a blocked pipe left the timeout hanging for ever —
+    the first version of this fix looked exactly like the bug it was meant to catch. Meanwhile
+    `run()`'s loop takes the queue with `asyncio.wait_for` and notes "No audio
     from the source for 30 s — capture stalled?" (then every `CAPTURE_WARN_AGAIN_SECONDS`) and
     "Audio is back after …" when it returns. Verified live by suspending the source: the
     warning, the reopen and the notes all appeared, and unsuspending brought the level back.
@@ -298,6 +302,16 @@ patch the storage file from those, do not hand-edit the JSON.
     no loop. `/api/status` now composes `auto` from `cfg` and takes only `holding` from the
     loop's dict. Any other field a task maintains for the page has the same trap: if it must be
     right when nothing is arriving, read it from `cfg` (or a store the writer is not the loop).
+21. **The activity gate is silent, so a closed one looks like a dead add-on.** `active_entity`
+    (`input_boolean.activity_turntable`) is the listener's on/off switch: when it is off the
+    chunk loop returns before it touches `status["level"]`, publishes nothing and logs nothing
+    — the page showed `level —`, `playing no` and an idle rip panel, which is exactly what a
+    stalled capture looked like too. It only ever said so (`"%s is off"`) from inside the
+    track-clearing branch, i.e. after a track had played. The loop now writes
+    `status["active"]` on every chunk that flips it, logs and notes the transition, and the
+    page has an `activity` row that reads "off — not listening". Check that row before
+    believing anything else on the page: `ticks: 1242` in the loop with `level: None` was this,
+    not a stall.
 
 ## Ripping
 

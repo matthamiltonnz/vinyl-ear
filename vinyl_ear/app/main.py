@@ -52,7 +52,7 @@ RIP_SETTING_FIELDS = (
     "rip_auto_stop_seconds",
     "rip_split",
 )
-VERSION = "0.11.3"
+VERSION = "0.11.6"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -543,17 +543,27 @@ async def capture_stream(
     try:
         while not stop.is_set():
             try:
-                data = await asyncio.wait_for(
-                    asyncio.to_thread(proc.stdout.read, chunk_bytes),
-                    timeout=CAPTURE_STALL_SECONDS,
+                # `wait_for` around `to_thread` cannot work here: cancelling the task does
+                # not interrupt the thread, and asyncio waits for that cancellation to
+                # finish - so a blocked pipe leaves the timeout hanging for ever. `wait`
+                # just stops waiting, and the kill below unblocks the read.
+                read = asyncio.ensure_future(
+                    asyncio.to_thread(proc.stdout.read, chunk_bytes)
                 )
-            except asyncio.TimeoutError:
-                # The pipe is open and the source says RUNNING, but nothing has arrived:
-                # without this the whole add-on waits here for ever.
-                proc.kill()
-                raise CaptureError(
-                    "no audio for %ds" % CAPTURE_STALL_SECONDS
-                ) from None
+                done, _pending = await asyncio.wait(
+                    {read}, timeout=CAPTURE_STALL_SECONDS
+                )
+                if not done:
+                    proc.kill()
+                    read.add_done_callback(forget_task)
+                    raise CaptureError(
+                        "no audio for %ds" % CAPTURE_STALL_SECONDS
+                    )
+                data = read.result()
+            except CaptureError:
+                raise
+            except (OSError, ValueError) as err:
+                raise CaptureError("capture read failed: %s" % err) from err
             if not data:
                 stderr = b""
                 if proc.stderr is not None:
@@ -933,6 +943,29 @@ def note(status: dict[str, Any], text: str) -> None:
     events = status.setdefault("events", [])
     events.append((time.strftime("%H:%M:%S"), text[:160]))
     del events[:-40]
+
+
+def forget_task(task: asyncio.Task) -> None:
+    """Retrieve an abandoned task's outcome so asyncio does not report it as unhandled."""
+    if not task.cancelled():
+        task.exception()
+
+
+def watch_task(task: asyncio.Task, name: str) -> None:
+    """Say so when a background task stops, instead of letting it die unobserved.
+
+    `run()` holds every task in a local, so an exception inside one is never retrieved and
+    never printed: a dead capture reader looks exactly like a quiet room.
+    """
+
+    def done(finished: asyncio.Task) -> None:
+        if finished.cancelled():
+            return
+        error = finished.exception()
+        if error is not None:
+            log.error("%s stopped: %r", name, error)
+
+    task.add_done_callback(done)
 
 
 def pactl(*args: str, timeout: float = 10.0) -> str | None:
@@ -1644,6 +1677,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         "level": None,
         "levels": [],
         "playing": False,
+        "active": None,
         "failures": 0,
         "last_lookup": None,
         "last_answer": None,
@@ -1677,6 +1711,13 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         if encoder is not None
         else None
     )
+    # A task that stops on its own leaves the add-on half dead and says nothing: keep an eye
+    # on all four, because the reader dying is otherwise indistinguishable from a quiet room.
+    watch_task(reader, "capture reader")
+    watch_task(ripper, "rip worker")
+    watch_task(server, "web server")
+    if radio is not None:
+        watch_task(radio, "stream")
 
     prebuffer = bytearray()
     clip = bytearray()
@@ -1774,6 +1815,15 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                     log.info("Audio is back after %ds", now - last_chunk_at)
                     note(status, "Audio is back after %ds" % (now - last_chunk_at))
             last_chunk_at = now
+
+            if status.get("active") is not active["active"]:
+                # The gate only spoke up once a track had been playing, which made a cold
+                # start with the activity switch off look like a dead add-on.
+                status["active"] = active["active"]
+                gate_state = "on — listening" if active["active"] else "off — not listening"
+                if cfg.active_entity:
+                    log.info("%s is %s", cfg.active_entity, gate_state)
+                    note(status, "%s is %s" % (cfg.active_entity, gate_state))
 
             if not active["active"]:
                 if playing:
@@ -2115,6 +2165,7 @@ INDEX_HTML = (
       <div class="gate" id="gateMark"></div>
     </div>
     <div class="spark" id="spark"></div>
+    <div class="row"><span>activity</span><span id="activity">—</span></div>
     <div class="row"><span>level</span><span id="level">—</span></div>
     <div class="row"><span>gate / measured floor</span><span id="gates">—</span></div>
     <div class="row"><span>audio above gate</span><span id="playing">—</span></div>
@@ -2227,6 +2278,9 @@ function renderMeter(status) {
   $("fill").style.width = pct(status.level) + "%";
   $("gateMark").style.left = pct(status.threshold) + "%";
   $("level").textContent = db(status.level);
+  $("activity").textContent = status.active === true
+    ? "on"
+    : (status.active === false ? "off — not listening" : "—");
   $("gates").textContent = db(status.threshold) + " / " + db(status.floor);
   $("playing").textContent = status.playing ? "yes — filling a clip" : "no";
   $("playing").style.color = status.playing ? "#9ccc65" : "";

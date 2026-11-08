@@ -372,6 +372,9 @@ style that paints the cover, artist, title and album over the stream.
 - Shazam identification is via the reverse-engineered API (`shazamio`), the same way
   shazam2mqtt and ha_shazamio do it. It is free and needs no key, but it is unofficial:
   if it ever breaks, swap the client for ACRCloud or AudD behind the same interface.
+- If nothing is happening at all, check the **activity** row first: while
+  `input_boolean.activity_turntable` is off the add-on still captures and the stream still
+  plays, but it deliberately does not look anything up, and the row says "off — not listening".
 - If the capture stops delivering altogether — a source the audio server has suspended, which
   is what an idle source gets — the add-on notices within 20 s, resumes the source, kills and
   reopens `parec`, and says so in the log and the event list. A quiet record is not that:
