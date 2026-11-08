@@ -33,7 +33,7 @@ Assistant hands to add-ons with `audio: true` — the same path that `parec` and
 
 | Entity | State | Attributes |
 | --- | --- | --- |
-| `sensor.vinyl_ear_<device_name>_now_playing` | `Artist - Title`; `Artist - Album` while a record plays but the track is not recognised; `Nothing playing` after `silence_clear_seconds` seconds of silence | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `unknown_track`, `url`, `source`, `identified_at` |
+| `sensor.vinyl_ear_<device_name>_now_playing` | `Artist - Title`; `Artist - Album` while a record plays but the track is not recognised (`unknown_track: true`, no title); empty between records, because a name for a record that is not there is worse than no name | `artist`, `title`, `album`, `year`, `genre`, `artwork`, `unknown_track`, `url`, `source`, `identified_at` |
 | `binary_sensor.vinyl_ear_<device_name>_audio_detected` | `ON` while the room is above the noise gate | — |
 
 `<device_name>` is the add-on option of the same name (`turntable` by default), and it
@@ -42,11 +42,14 @@ device name, so they carry the `vinyl_ear_` prefix; rename them in the UI if you
 `sensor.turntable_now_playing`. Everything appears under one HA device named
 `Vinyl Ear (<device_name>)`, created by MQTT discovery — no YAML required.
 
-Album artwork is downloaded to `/config/www/vinyl-art/<device_name>.jpg` and the
-`artwork` attribute points at `/local/vinyl-art/<device_name>.jpg?v=<epoch>` so every
-client (including Cast displays and other networks) loads the cover from Home Assistant
-instead of Apple's CDN, whose URLs expire. The untouched CDN URL is kept in
-`artwork_remote`. This needs the add-on's read-write access to `/config` (`map: config:rw`),
+Album artwork is downloaded to `/config/www/vinyl-art/<device_name>-<epoch>.jpg` (the
+fixed `<device_name>.jpg` is refreshed alongside it) and the `artwork` attribute points at
+that epoch-named file, so every client (including Cast displays and other networks) loads
+the cover from Home Assistant instead of Apple's CDN, whose URLs expire. A new file name
+each time matters: `/local` is served with a 31 day cache, 404s included, and a Cast
+display will not re-fetch a URL it has already seen — query strings included. The
+untouched CDN URL is kept in `artwork_remote`. This needs the add-on's read-write access to
+`/config` (`map: config:rw`),
 which is already declared; if the folder is not writable the remote URL is published as
 before.
 
@@ -217,8 +220,9 @@ style that paints the cover, artist, title and album over the stream.
   (`Artist - Album`, `unknown_track: true`) rather than repeating the previous song;
   set `blank_unknown_track: false` to keep the last title instead.
 - Silence clears it: once the room is judged quiet for `silence_clear_seconds`
-  seconds — needle lifted, side changed, record put away — the state is replaced with
-  `Nothing playing` and the artwork and attributes are emptied, so the dashboard stops
-  claiming a track that finished minutes ago.
+  seconds — needle lifted, side changed, record put away — the state is emptied (no
+  display text, no artwork, no attributes), so the dashboard stops claiming a track that
+  finished minutes ago. The bundled cards hide themselves when there is nothing to show:
+  no "Nothing playing" line, no "track not identified" placeholder, just the camera.
 - Recognition requests only happen while the room is above the noise gate, at most
   once every `poll_seconds`.

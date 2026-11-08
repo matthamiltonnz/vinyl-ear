@@ -7,7 +7,7 @@ decoding; no framework, no tests directory.
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.6.5**.
+what the startup banner prints). Current: **0.6.6**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -57,6 +57,20 @@ Storage-mode dashboard, so views are edited by patching
 alone shows nothing; and an open editor tab writes its stale copy back over any patch
 when the user presses Done. Take a `lovelace.lovelace.bak-<timestamp>` copy every time.
 
+With Home Assistant stopped its container cannot `docker exec`, so patch from a one-off
+container built on the same image (it has PyYAML):
+`sudo docker stop --timeout 60 homeassistant` then
+`sudo docker run --rm -i --volumes-from homeassistant --entrypoint python ghcr.io/home-assistant/generic-x86-64-homeassistant:<version> -`
+with the script on stdin. `-v /config:/config` does **not** work on HAOS (there is no such
+path on the host), and `/tmp` bind mounts come up empty, so keep the patch self-contained.
+Also note that `card_mod` and markdown templates are rendered *server side* through the
+`render_template` websocket call: a broken one shows up in `docker logs homeassistant` as
+`Error while processing template: Template<template=(...)` — check that log after every
+dashboard change, and remember a client that was already open keeps re-rendering its old
+copy, so errors can appear for a minute after the restart. Parse every template with
+`jinja2.Environment().parse()` before writing the file; a stray `{%- endif %}` closing the
+wrong `if` is exactly how a working pill turns into "Encountered unknown tag 'else'".
+
 Relevant cards on that installation:
 
 - View `views[0]` (title in `AGENTS.local.md`) → `vertical-stack` → **card 6** is the turntable
@@ -66,6 +80,15 @@ Relevant cards on that installation:
   `card_mod` pill (`ha-card::after`) — this is the one that gets cast to the TV.
 - `custom:webrtc-camera` comes from the WebRTC integration; `lovelace-card-mod` is
   installed, so `card_mod` is available everywhere.
+
+Both turntable cards hide themselves when nothing is named — that is the rule the user
+asked for in 0.6.6: no "Nothing playing" line, no "track not identified" placeholder, no
+pill over the camera until there is an artist, album or title to put in it. An unrecognised
+track keeps the artist and sleeve from the last answer and drops its own line; the add-on
+publishes an empty `display` for idle and for "audio but nothing known", so the templates
+test the attributes rather than the state string. `lovelace/turntable-remote-stack.yaml`
+and `lovelace/turntable-overlay-card.yaml` are the two files that mirror this dashboard;
+patch the storage file from those, do not hand-edit the JSON.
 
 ## Gotchas, with the symptom that exposed each
 
@@ -102,6 +125,14 @@ Relevant cards on that installation:
    `ha-card::before { content: url('{{ art }}') }` — real replaced content rather than a
    background. If it ever goes missing again, compare the two: markdown `<img>` working and
    `::before` not means the trouble is painting, both failing means the URL or the file.
+   It was still missing on the cast with all of that in place (0.6.6): the pill's *text*
+   rendered, so painting was fine and it was the image request that failed — and the only
+   artwork URL that cast had ever been given was the fixed-path fallback, because the pill
+   painted `url('/local/vinyl-art/<device>.jpg')` whenever the state carried no `artwork`
+   attribute (idle, or a record nobody had named). That path is the cached 404. The add-on
+   now writes each cover to `<device_name>-<epoch>.jpg` and publishes that path, so no
+   client ever sees the same artwork URL twice; the fixed `<device_name>.jpg` is only kept
+   in step for anything else that points at it. The cards no longer fall back to it at all.
 6. **A fixed noise gate is useless in a quiet-ish but not silent room, and a clever one
    can silence the listener.** At -45 dBFS in a -35 dBFS room every chunk counted as
    audio: the state never cleared and Shazam was called every 30 s on noise. But taking

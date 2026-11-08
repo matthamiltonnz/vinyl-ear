@@ -1,10 +1,18 @@
 # Full screen camera with the now playing details painted over it (panel view).
 #
+# The pill is drawn only when there is something to say: artist, track and album are
+# painted as one block, and when Shazam has not named anything there is no pill at all
+# rather than a line saying so. An unnamed track keeps the artist and sleeve from the
+# last answer and simply drops its own line.
+#
 # Home Assistant serves /local with `Cache-Control: public, max-age=2678400` (31 days),
 # 404s included, so a fixed artwork path pins whatever the Cast display first fetched —
-# usually a 404 from before the first match, which then never resolves. Use the
-# epoch-tagged `artwork` attribute instead: every new cover is a new URL, so the browser
-# has to fetch it, and the pill text updates on the same render.
+# usually a 404 from before the first match, which then never resolves. The add-on
+# therefore writes every cover under its own epoch-named file and publishes that path in
+# the `artwork` attribute, so each new cover is a URL no client has ever seen. Paint it
+# twice: `::before` as a background image, and the pill's own background image, because a
+# pseudo-element's `content: url()` and a background image are not equally reliable on a
+# cast receiver.
 type: panel
 title: Turntable
 path: turntable
@@ -19,45 +27,43 @@ cards:
         {%- set album = state_attr(s, 'album') -%}
         {%- set year = state_attr(s, 'year') -%}
         {%- set art = state_attr(s, 'artwork') -%}
-        {%- if is_state(s, 'unavailable') or is_state(s, 'unknown') -%}
-        {%- set lines = 'Vinyl Ear is offline — is the add-on running?' -%}
-        {%- elif artist or title or album -%}
-        {%- set lines = artist ~ '\\00000A' ~ (title or 'track not identified') ~ ('\\00000A' ~ album ~ (' · ' ~ year if year else '') if album else '') -%}
-        {%- else -%}
-        {%- set lines = 'Nothing playing — drop the needle' -%}
-        {%- endif -%}
+        {%- set lines = [] -%}
+        {%- if artist %}{% set lines = lines + [artist] %}{% endif -%}
+        {%- if title %}{% set lines = lines + [title] %}{% endif -%}
+        {%- if album %}{% set lines = lines + [album ~ (' (' ~ year ~ ')' if year else '')] %}{% endif -%}
+        {%- if lines %}
         {%- if art %}
         ha-card::before {
-          content: url('{{ art }}');
+          content: "";
           position: absolute;
           top: calc(3.5% + 18px);
           left: calc(2.5% + 22px);
           width: 88px;
           height: 88px;
-          object-fit: cover;
+          background-image: url('{{ art }}');
+          background-position: center;
+          background-size: cover;
           border-radius: 12px;
           z-index: 4;
           pointer-events: none;
         }
         {%- endif %}
         ha-card::after {
-          content: "{{ lines }}";
+          content: "{{ lines | join('\\00000A') }}";
           position: absolute;
           display: block;
           top: 3.5%;
           left: 2.5%;
           max-width: 62%;
-          padding: 18px 26px 18px 132px;
+          padding: 18px 26px 18px {{ '132px' if art else '26px' }};
           border-radius: 20px;
           background-color: rgba(8, 10, 16, 0.66);
           {%- if art %}
           background-image: url('{{ art }}');
-          {%- else %}
-          background-image: url('/local/vinyl-art/turntable.jpg');
-          {%- endif %}
           background-position: 22px center;
           background-size: 88px 88px;
           background-repeat: no-repeat;
+          {%- endif %}
           min-height: 88px;
           color: #ffffff;
           font-size: 1.45rem;
@@ -69,3 +75,9 @@ cards:
           z-index: 3;
           pointer-events: none;
         }
+        {%- else %}
+        ha-card::before,
+        ha-card::after {
+          content: none;
+        }
+        {%- endif %}

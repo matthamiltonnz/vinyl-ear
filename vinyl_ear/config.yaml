@@ -1,5 +1,5 @@
 name: Vinyl Ear
-version: "0.6.5"
+version: "0.6.6"
 slug: vinyl_ear
 description: Listens to a room microphone, identifies the record that is playing with Shazam, and publishes it to Home Assistant over MQTT
 url: https://github.com/matthamiltonnz/vinyl-ear

@@ -33,8 +33,10 @@ from shazamio import Shazam
 
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
 ARTWORK_DIR = Path("/config/www/vinyl-art")
+# How many epoch-named covers to keep beside the fixed `device_name.jpg`.
+ARTWORK_KEEP = 5
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.6.5"
+VERSION = "0.6.6"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -347,6 +349,12 @@ async def cache_artwork(
         log.warning("Artwork folder unavailable (%s); publishing the remote URL", err)
         return url
 
+    # Every cover gets its own file name. A query string is not enough to shake a Cast
+    # display loose of a /local URL it has already fetched (the folder is served with a
+    # 31 day cache, 404s included); a path it has never seen cannot be in any cache. The
+    # fixed name is still written for anything that points at it.
+    stamp = int(time.time())
+    versioned = ARTWORK_DIR / f"{device_name}-{stamp}.jpg"
     target = ARTWORK_DIR / f"{device_name}.jpg"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
@@ -354,15 +362,24 @@ async def cache_artwork(
             data = await response.read()
         if not data:
             raise ValueError("empty response")
-        temporary = target.with_suffix(".tmp")
+        temporary = versioned.with_suffix(".tmp")
         temporary.write_bytes(data)
-        os.replace(temporary, target)
+        os.replace(temporary, versioned)
+        try:
+            shutil.copyfile(versioned, target)
+        except OSError as err:
+            log.debug("Could not refresh %s (%s)", target.name, err)
     except Exception as err:  # noqa: BLE001 - the remote URL is an acceptable fallback
         log.warning("Could not cache artwork (%s); publishing the remote URL", err)
         return url
 
-    log.info("Cached artwork for %s (%d bytes)", device_name, len(data))
-    return f"/local/vinyl-art/{device_name}.jpg?v={int(time.time())}"
+    log.info("Cached artwork for %s (%d bytes) as %s", device_name, len(data), versioned.name)
+    for stale in sorted(ARTWORK_DIR.glob(f"{device_name}-*.jpg"))[:-ARTWORK_KEEP]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    return f"/local/vinyl-art/{versioned.name}"
 
 
 def parse_track(response: dict[str, Any], device_name: str) -> dict[str, Any] | None:
@@ -440,8 +457,11 @@ def apply_album_preference(
 
 
 def idle_track(device_name: str) -> dict[str, Any]:
+    # No display text at all: "Nothing playing" is a name for a record that is not there,
+    # and the panel hides its pill rather than print it. The `playing` binary sensor is
+    # what says whether the turntable is running.
     return {
-        "display": "Nothing playing",
+        "display": "",
         "title": "",
         "artist": "",
         "album": "",
@@ -469,7 +489,7 @@ def unidentified_track(previous: dict[str, Any]) -> dict[str, Any]:
     if artist and album:
         display = f"{artist} - {album}"
     else:
-        display = artist or album or "Track not identified"
+        display = artist or album or ""
     return {
         **previous,
         "display": display,
@@ -794,17 +814,20 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                     log.info(
                         "Heard audio (%.0f dBFS) but Shazam did not recognise it", level
                     )
-                    if (
-                        cfg.blank_unknown_track
-                        and current_key is not None
-                        and last_track is not None
-                        and not state_is_unidentified
-                    ):
-                        publish(client, state_topic, json.dumps(unidentified_track(last_track)))
+                    if cfg.blank_unknown_track and not state_is_unidentified:
+                        # Nothing is named until Shazam answers again: the previous track
+                        # name is a guess about what is on the platter now, so drop it and
+                        # keep only the artist and sleeve that were already known.
+                        previous = (
+                            last_track
+                            if last_track is not None
+                            else idle_track(cfg.device_name)
+                        )
+                        publish(client, state_topic, json.dumps(unidentified_track(previous)))
                         state_is_unidentified = True
                         log.info(
                             "Unidentified track: keeping the album %r, blanking the track name",
-                            last_track.get("album") or "unknown",
+                            previous.get("album") or "unknown",
                         )
                 else:
                     key = track_identity(track)

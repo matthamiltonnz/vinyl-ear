@@ -19,13 +19,12 @@ cards:
           {%- if art -%}<img src="{{ art }}" width="72" height="72" style="display:block;border-radius:10px;flex:0 0 auto">{%- endif -%}
           <div style="min-width:0">
           <div style="font-size:1.6rem;font-weight:700;line-height:1.15">{{ artist }}</div>
-          <div style="font-size:1.2rem;line-height:1.25;opacity:0.85">{{ title or 'track not identified' }}</div>
+          <div style="font-size:1.2rem;line-height:1.25;opacity:0.85">{{ title }}</div>
           {%- if album -%}
           <div style="font-size:0.95rem;opacity:0.6;margin-top:4px">{{ album }}{% if year %} · {{ year }}{% endif %}</div>
           {%- endif -%}
           </div></div>
           {%- else -%}
-          Nothing playing — drop the needle.
           {%- endif -%}
       - type: custom:webrtc-camera
         url: Turntable
