@@ -469,7 +469,15 @@ while ffmpeg is not running, so feed *after* the first connection rather than be
 4. Commit and push to https://github.com/matthamiltonnz/vinyl-ear (public — check the
    diff for anything installation specific first, see below).
 5. The user presses **Rebuild** on the add-on page; Lovelace changes land through an HA
-   restart (see above).
+   restart (see above). The build can also be started with `POST /addons/<slug>/rebuild` from
+   the Home Assistant container (same script as the reload), which is how 0.9.0 went in: the
+   copy, the reload, the update and the rebuild all ran over SSH, and the whole thing took
+   about 40 s because the base layers were cached. Afterwards check that
+   `docker images | grep vinyl` shows the new tag, that `docker logs app_local_vinyl_ear` says
+   `Vinyl Ear <version> starting`, and — a local add-on whose files were copied but never
+   reloaded still reports the *old* version, with no update offered, because the supervisor is
+   comparing its cached copy of `config.yaml`. `/addons/<slug>/info` is the cheap way to see
+   what it believes (`version`, `state`, `update_available`).
 6. Remove scratch files from `/config` and `/tmp` — `/config` is their live Home
    Assistant configuration directory.
 7. Before pushing: `grep -rInE '([0-9]{1,3}\.){3}[0-9]{1,3}|@|alsa_input|ssh ' --exclude-dir=.git .`
