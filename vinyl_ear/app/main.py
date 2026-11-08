@@ -52,7 +52,7 @@ RIP_SETTING_FIELDS = (
     "rip_auto_stop_seconds",
     "rip_split",
 )
-VERSION = "0.11.1"
+VERSION = "0.11.2"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -85,6 +85,15 @@ TRACK_CONFIRM_SECONDS = 180.0
 TRACK_CONFIRM_LOOKBACK = 4
 MAX_COOLDOWN_SECONDS = 300.0
 HEARTBEAT_SECONDS = 300.0
+# A source can be `RUNNING` and still deliver nothing, which blocks `parec`'s pipe
+# forever and freezes the gate, the lookups and the rip with it. A silent read for this
+# long is treated as a stall: the process is killed and reopened.
+CAPTURE_STALL_SECONDS = 20.0
+CAPTURE_RESTART_SECONDS = 5.0
+CAPTURE_RESTART_MAX_SECONDS = 60.0
+# How long the listener waits for a chunk before saying so in the log and the event list.
+CAPTURE_WARN_SECONDS = 30.0
+CAPTURE_WARN_AGAIN_SECONDS = 300.0
 # How often a running rip publishes its elapsed time and peak level.
 RIP_REPORT_SECONDS = 10.0
 # How long the rip worker waits for a chunk before looking at its command queue again.
@@ -490,7 +499,36 @@ async def audio_reader(
     `tap` sees every chunk as well - that is how a rip records the same audio the listener
     hears, from a single `parec`, because a second reader on the same USB device cannot be
     relied on to return sound.
+
+    `parec` is supervised: it is reopened when it ends or when its pipe goes silent for
+    `CAPTURE_STALL_SECONDS`, because a source that is `RUNNING` but delivering nothing
+    leaves the read blocked and the whole add-on waiting behind it.
     """
+    restarts = 0
+    while not stop.is_set():
+        try:
+            await capture_stream(cfg, source, queue, channels, tap)
+        except CaptureError as err:
+            if stop.is_set():
+                return
+            restarts += 1
+            delay = min(
+                CAPTURE_RESTART_MAX_SECONDS, CAPTURE_RESTART_SECONDS * restarts
+            )
+            log.warning("%s — reopening the capture in %ds", err, delay)
+            await asyncio.sleep(delay)
+        else:
+            return
+
+
+async def capture_stream(
+    cfg: Config,
+    source: str,
+    queue: "asyncio.Queue[bytes]",
+    channels: int = 1,
+    tap: Callable[[bytes], Awaitable[None]] | None = None,
+) -> None:
+    """One `parec`, read until it hands over audio, stalls or ends."""
     command = parec_command(cfg, source, channels)
     log.debug("Starting capture: %s", " ".join(command))
     proc = subprocess.Popen(
@@ -503,7 +541,18 @@ async def audio_reader(
     chunk_bytes = int(cfg.sample_rate * 2 * channels * CHUNK_SECONDS)
     try:
         while not stop.is_set():
-            data = await asyncio.to_thread(proc.stdout.read, chunk_bytes)
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.to_thread(proc.stdout.read, chunk_bytes),
+                    timeout=CAPTURE_STALL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # The pipe is open and the source says RUNNING, but nothing has arrived:
+                # without this the whole add-on waits here for ever.
+                proc.kill()
+                raise CaptureError(
+                    "no audio for %ds" % CAPTURE_STALL_SECONDS
+                ) from None
             if not data:
                 stderr = b""
                 if proc.stderr is not None:
@@ -521,7 +570,6 @@ async def audio_reader(
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-
 
 async def supervised_entity_is_on(session: aiohttp.ClientSession, entity_id: str) -> bool:
     """Read an entity state through the supervisor's Home Assistant API proxy."""
@@ -1679,10 +1727,39 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             track["year"] or "unknown year",
         )
 
+    last_chunk_at = time.monotonic()
+    gap_noted_at: float | None = None
     try:
         while not stop.is_set():
-            data = await queue.get()
+            try:
+                data = await asyncio.wait_for(
+                    queue.get(), timeout=CAPTURE_WARN_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # No chunk at all, which is never silence - a digital-silent source still
+                # sends bytes. Say so once, then every few minutes, and keep waiting.
+                silent_for = time.monotonic() - last_chunk_at
+                if gap_noted_at is None or (
+                    time.monotonic() - gap_noted_at >= CAPTURE_WARN_AGAIN_SECONDS
+                ):
+                    gap_noted_at = time.monotonic()
+                    log.warning(
+                        "No audio from the source for %ds - has the capture stalled?",
+                        silent_for,
+                    )
+                    note(
+                        status,
+                        "No audio from the source for %ds - capture stalled?"
+                        % silent_for,
+                    )
+                continue
             now = time.monotonic()
+            if gap_noted_at is not None:
+                gap_noted_at = None
+                if now - last_chunk_at >= CAPTURE_WARN_SECONDS:
+                    log.info("Audio is back after %ds", now - last_chunk_at)
+                    note(status, "Audio is back after %ds" % (now - last_chunk_at))
+            last_chunk_at = now
 
             if not active["active"]:
                 if playing:
@@ -1818,11 +1895,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if stopped:
                 rip_heard_music = False
             was_recording = recording
-            status["auto"] = {
-                "start": cfg.rip_auto_start,
-                "stop": cfg.rip_auto_stop,
-                "holding": auto_hold,
-            }
+            status["auto"]["holding"] = auto_hold
 
             prebuffer.extend(data)
             if len(prebuffer) > prebuffer_bytes:
@@ -2485,6 +2558,14 @@ async def web_server(
         payload["rips"] = [item for item in rips if item["name"] != mid_rip]
         payload["rip_dir"] = cfg.rip_dir
         payload["settings"] = rip_settings(cfg)
+        # The chunk loop is the only writer of `holding`, but it only runs while audio
+        # arrives: taking the on/off flags from it made the page say "off" after the
+        # settings had been changed on a silent input.
+        payload["auto"] = {
+            "start": cfg.rip_auto_start,
+            "stop": cfg.rip_auto_stop,
+            "holding": payload.get("auto", {}).get("holding", False),
+        }
         payload["now"] = time.time()
         looked_up = status.get("last_lookup")
         payload["last_lookup_seconds"] = (

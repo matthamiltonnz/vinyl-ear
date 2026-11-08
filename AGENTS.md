@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.11.1**.
+what the startup banner prints). Current: **0.11.2**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -277,6 +277,23 @@ patch the storage file from those, do not hand-edit the JSON.
     timeline with the cut offset added back to each cut point. Setting `recorder.frames` to the
     trimmed length and reporting again is what keeps the published duration honest — the
     retained payload had already gone out with the untrimmed side.
+19. **A source can be `RUNNING` and still deliver nothing, and nothing in the add-on noticed.**
+    Seen in the field after 0.11.1 went in: `pactl list sources short` said `RUNNING`, `parec`
+    was alive and attached, and the page showed `level: null` with no heartbeats — because the
+    read on `parec`'s pipe was blocked, so the chunk loop never ran, and the heartbeat, the gate,
+    the lookups and the rip all live behind that read. Digital silence is *not* this: a silent
+    source still sends bytes, so "no chunk for 30 s" is always a fault. `audio_reader()` is now a
+    supervisor around `capture_stream()`: a read that times out after `CAPTURE_STALL_SECONDS`
+    kills the process and reopens it with a growing backoff, and `run()`'s loop takes the queue
+    with `asyncio.wait_for`, noting "No audio from the source for 45 s — capture stalled?" in the
+    log and the event list (then every `CAPTURE_WARN_AGAIN_SECONDS`) and "Audio is back after …"
+    when it returns. Without that, a stalled capture is indistinguishable from a quiet room.
+20. **`status["auto"]` is written by the chunk loop, so it goes stale on a silent input.** The
+    Rip panel said "auto-rip off" while both boxes were ticked: the settings row reads `cfg` on
+    every poll, but the auto flags were a snapshot the loop refreshed — and a dead capture means
+    no loop. `/api/status` now composes `auto` from `cfg` and takes only `holding` from the
+    loop's dict. Any other field a task maintains for the page has the same trap: if it must be
+    right when nothing is arriving, read it from `cfg` (or a store the writer is not the loop).
 
 ## Ripping
 
@@ -462,6 +479,15 @@ For the state machine, monkeypatch `audio_reader` (push synthetic chunks paced a
 Generate tones with `struct.pack("<h", …)`: amplitude 820 is about -35 dBFS, 3600 about
 -22 dBFS. That is how the threshold calibration, the silence clearing and the back-off
 were verified.
+
+The capture has two halves worth testing without PulseAudio. For the reader, monkeypatch
+`mod.parec_command` to return a dummy command and `mod.subprocess` to a shim whose `Popen`
+returns a fake process (`stdout.read` that blocks, then one that returns bytes), shrink
+`CAPTURE_STALL_SECONDS` and `CAPTURE_RESTART_SECONDS`, and check `audio_reader()` spawns twice,
+kills the first process and delivers the second one's chunk. For the loop's side of it, feed
+`run()` a fake `audio_reader` that can stop delivering and shrink `CAPTURE_WARN_SECONDS`: the
+event list must gain "No audio from the source for Ns — capture stalled?" and then "Audio is
+back after Ns".
 
 To exercise the time-based rules in seconds rather than hours, replace `module.time` with
 a shim whose `monotonic()` returns a mutable value and whose other attributes fall through
