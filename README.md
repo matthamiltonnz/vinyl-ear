@@ -261,7 +261,7 @@ Some things decide whether the result is worth keeping:
   ffmpeg -i side-a.flac -af silencedetect=noise=-40dB:d=1 -f null -  # where the gaps are
   ffmpeg -i side-a.flac -ss 0 -to 212 -c copy track-01.flac          # then cut them out
   ```
-## Stream it to Music Assistant
+## Stream it to anything that plays a URL
 
 Set `stream_enabled` and the add-on also serves the live capture as a radio stream — the same
 PCM the listener hears and the ripper records, encoded by ffmpeg — so Music Assistant (or
@@ -274,9 +274,10 @@ http://<home-assistant>:8098/stream.m3u      # a playlist that points at the act
 http://<home-assistant>:8098/now-playing     # the ICY title, as JSON
 ```
 
-In Music Assistant: **Settings → Providers → Add Provider → Radio**, add a radio station,
-paste the `.mp3` URL and call it *Vinyl Ear*. Home Assistant's own `media_player` can play the
-same URL.
+Anything that takes a radio URL can consume it — the add-on's own page shows the URL with a
+**Copy URL** button. In Music Assistant, one way to wire it up: **Settings → Providers → Add
+Provider → Radio**, add a radio station, paste the `.mp3` URL and call it *Vinyl Ear*. Home
+Assistant's own `media_player`, VLC and a phone's podcast app take the same URL.
 
 The stream carries the detected track as **ICY metadata** (`icy-metaint` blocks with
 `StreamTitle='Artist - Title';`), which is what a radio station uses to show what is playing —
@@ -325,6 +326,10 @@ installation.
   finished recordings in `rip_dir` with their sizes. Each can be played, downloaded or
   deleted. Files are addressed by name and only inside `rip_dir`, so nothing else on the disk
   is reachable; the file being written is refused until it is closed.
+- **Radio stream** — whether the encoder is running, how many listeners are attached, the
+  codec, and the stream URL with a **Copy URL** button. The clipboard API only exists in a
+  secure context, so on a plain-http ingress origin the button falls back to selecting the
+  text; the URL is `user-select: all` either way.
 - **Event log** — the last 40 things that happened: recognitions, refusals, gate changes and
   rip starts and stops. It is the quickest way to tell "the record is not being heard" from
   "it is heard but Shazam does not know it".

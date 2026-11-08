@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.11.0**.
+what the startup banner prints). Current: **0.11.1**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -388,6 +388,11 @@ the URL the page prints (`location.hostname` + `:8098`).
   months ago still works after a format change.
 - The extra endpoints are for humans and for checking: `/` (a text summary), `/stream.m3u`,
   `/now-playing` (JSON). Nothing on this port changes any state.
+- Nothing here is Music Assistant specific. MA is only the reason the port is published at all
+  (it is not a browser and cannot carry an ingress session); the URL works in VLC, a phone, HA's
+  own `media_player` or anything else that takes a radio URL. The page therefore offers it as
+  one option, not as *the* way in, and has a **Copy URL** button because typing the host and port
+  by hand is exactly where people get it wrong.
 
 ## Web interface
 
@@ -417,6 +422,15 @@ is what makes it work under the ingress prefix `/api/hassio_ingress/<token>/` wi
 the prefix. Absolute `/api/...` URLs would hit Home Assistant itself and 404. Artwork is the
 exception and stays as published: `/local/vinyl-art/...` is root-relative on the same origin,
 which is correct because the ingress page is served from Home Assistant's origin.
+
+The one thing the page hands over to be pasted somewhere else is the **stream URL**, which is
+built from `location.hostname` + `STREAM_PORT` because the page cannot know the add-on's port
+from inside the container. Its **Copy URL** button goes through `copyText()`, which uses
+`navigator.clipboard` only when `window.isSecureContext` is true and otherwise selects a
+temporary textarea and calls `document.execCommand("copy")` — ingress on a plain-http HA is not
+a secure context, so the clipboard API is simply absent there. The text lives in
+`streamUrlText` because `renderStream()` runs on every poll and the click needs the value that
+was rendered; the button is disabled while `stream_enabled` is off.
 
 ## Testing without a turntable
 
@@ -473,7 +487,10 @@ MQTT switch and the button provably share one path) and with `{"action":"rewind"
 queue untouched), `GET /files/<name>` (inline) and `?download=1` (attachment),
 `GET /files/notes.txt` and `GET /files/%2e%2e%2fmain.py` (both 404), then `DELETE` and check
 the file is gone and the listing shrank. Move `WEB_PORT` off 8099 in the harness so it cannot
-collide with a real Home Assistant on the developer's machine. Driving `rip_worker()` with a
+collide with a real Home Assistant on the developer's machine. The page is one Python string, so
+a broken script only shows up in a browser: pull the `<script>` out of the served page and run
+`node --check` on it, and check the stream panel offers `id="streamCopy"` with `copyText()` behind
+it (its fallback path is what runs under plain-http ingress). Driving `rip_worker()` with a
 fake tape and a fake client checks the other half: `status["rip"]` goes `recording` → `idle`,
 names the `.wav` while recording and the `.flac` after, and — gotcha 11 — the tape must be
 allowed to go *dry* before `OFF` is queued. The whole `run()` can be driven the same way with

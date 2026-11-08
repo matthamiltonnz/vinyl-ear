@@ -52,7 +52,7 @@ RIP_SETTING_FIELDS = (
     "rip_auto_stop_seconds",
     "rip_split",
 )
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -1985,7 +1985,11 @@ INDEX_HTML = (
                   border-radius: 7px; padding: 3px 6px; font: inherit; font-size: .85rem; }
   input.small { width: 64px; }
   input[type="checkbox"] { width: auto; }
-  .buttons { display: flex; gap: 10px; flex-wrap: wrap; }
+  .buttons { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  code {
+    background: #1b212b; border: 1px solid #262d38; border-radius: 7px;
+    padding: 4px 8px; font-size: .85rem; user-select: all;
+  }
   button:disabled { opacity: .45; cursor: default; }
   table { width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: 12px; }
   th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #1d2430; }
@@ -2077,8 +2081,10 @@ INDEX_HTML = (
     <div class="row"><span>state</span><span id="streamState">off</span></div>
     <div class="row"><span>listeners</span><span id="streamClients">0</span></div>
     <div class="row"><span>quality</span><span id="streamBitrate">—</span></div>
-    <p class="muted">Add this as a radio station in Music Assistant:</p>
-    <p><code id="streamUrl">—</code></p>
+    <p class="muted">A plain HTTP audio stream, so anything that takes a radio URL can
+      play it — Music Assistant, VLC, a phone, another Home Assistant:</p>
+    <p class="buttons"><code id="streamUrl">—</code>
+      <button id="streamCopy" class="quiet">Copy URL</button></p>
   </section>
   <section>
     <h2>Event log</h2>
@@ -2213,6 +2219,7 @@ function renderRip(status) {
 }
 
 let settingsDirty = false;
+let streamUrlText = "";
 
 function renderSettings(settings) {
   if (!settings || settingsDirty) return;   // never stomp on what is being edited
@@ -2284,9 +2291,11 @@ function renderStream(status) {
   $("streamBitrate").textContent = !stream.enabled
     ? "—"
     : (format === "flac" ? "lossless FLAC" : (stream.bitrate || 128) + " kbit/s MP3");
-  $("streamUrl").textContent = stream.enabled
+  streamUrlText = stream.enabled
     ? "http://" + location.hostname + ":8098/stream." + format
-    : "—";
+    : "";
+  $("streamUrl").textContent = streamUrlText || "—";
+  $("streamCopy").disabled = !streamUrlText;
 }
 
 function renderEvents(events) {
@@ -2366,6 +2375,42 @@ $("ripButton").onclick = () => {
 };
 
 $("gainButton").onclick = () => ripAction("gain");
+
+// navigator.clipboard only exists in a secure context, and ingress can be plain http,
+// so fall back to the old select-and-copy trick before giving up.
+async function copyText(value) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch (err) {
+    // fall through to the textarea
+  }
+  const area = document.createElement("textarea");
+  area.value = value;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.top = "-1000px";
+  document.body.appendChild(area);
+  area.select();
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (err) {
+    copied = false;
+  }
+  document.body.removeChild(area);
+  return copied;
+}
+
+$("streamCopy").onclick = async () => {
+  if (!streamUrlText) return;
+  const button = $("streamCopy");
+  const copied = await copyText(streamUrlText);
+  button.textContent = copied ? "Copied" : "Copy failed";
+  setTimeout(() => { button.textContent = "Copy URL"; }, 1500);
+};
 
 refresh();
 setInterval(refresh, 1000);
