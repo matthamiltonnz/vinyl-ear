@@ -2,12 +2,13 @@
 
 Home Assistant add-on that works out **what record is playing** on the turntable and
 publishes it to Home Assistant over MQTT. Vinyl is analogue, so nothing reports track
-metadata — this listens to a room microphone or a line input, fingerprints the audio with
-Shazam, and fills in the gap. The same input can be recorded losslessly, a side at a time,
-for ripping.
+metadata — this listens to a microphone or any capture device connected to Home Assistant
+(a webcam mic in the room, or a line input fed by the turntable's own output), fingerprints
+the audio with Shazam, and fills in the gap. The same input can be recorded losslessly, a
+side at a time, for ripping.
 
 ```
-room mic ──▶ noise gate ──▶ 15 s clip ──▶ Shazam (shazamio) ──▶ MQTT discovery
+mic/line ──▶ noise gate ──▶ 15 s clip ──▶ Shazam (shazamio) ──▶ MQTT discovery
                                                                  ├─ sensor.turntable_now_playing
                                                                  └─ binary_sensor.turntable_audio
 ```
@@ -93,10 +94,10 @@ A local add-on must be **Rebuilt** (not just restarted) after every code change.
 
 ## Before you trust the audio
 
-The webcam microphone must actually be listening. A USB webcam mic is usually turned
-right down in PulseAudio — one seen here was sitting at **12% (-55 dB)**, i.e. muted —
-and no amount of fingerprinting will fix that. List the sources and raise the one that
-is not a `.monitor`:
+Whichever input you use must actually be listening. USB capture devices are often turned
+right down in PulseAudio — one webcam mic seen here was sitting at **12% (-55 dB)**, i.e.
+muted — and no amount of fingerprinting will fix that. List the sources and raise the one
+that is not a `.monitor`:
 
 ```bash
 pactl list short sources
@@ -104,13 +105,14 @@ pactl set-source-volume <source> 45%
 ```
 
 45% measured about -25 dB mean / -8 dB peak on a record and matched within seconds, while
-70% clipped. Nothing else uses that mic (the go2rtc "Turntable" stream is video-only), so
-the gain can stay where you put it.
+70% clipped. Nothing else was reading that source (the go2rtc "Turntable" stream is
+video-only), so the gain can stay where you put it.
 
 ## Options
 
-The microphone is opened once and read continuously in 250 ms chunks, so the level is
-sampled four times a second rather than in bursts:
+The capture source — a microphone, a line input, a USB interface — is opened once and read
+continuously in 250 ms chunks, so the level is sampled four times a second rather than in
+bursts:
 
 - **Silence → sound triggers an immediate lookup.** After at least 2 s of quiet, the
   next audio above the noise gate starts a fresh clip (with 1.5 s of pre-roll so the
@@ -171,7 +173,7 @@ sampled four times a second rather than in bursts:
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `source` | *(auto)* | PulseAudio source name, e.g. the line input of a USB interface. Empty picks the first non-monitor input; set it explicitly once a second capture device is plugged in, because the order is not guaranteed. |
+| `source` | *(auto)* | PulseAudio source name of the capture device — a line input such as a USB interface, or a microphone. Empty picks the first non-monitor input; set it explicitly once a second capture device is plugged in, because the order is not guaranteed. |
 | `active_entity` | *(none)* | Optional `input_boolean` that switches detection on and off, e.g. `input_boolean.activity_turntable`. Empty means the web interface's **Listening** switch decides instead (off until turned on). Read through the supervisor's Home Assistant API; if it cannot be read at all the manual switch takes over. |
 | `sample_rate` | `44100` | Capture rate; Shazam downsamples internally. |
 | `listen_seconds` | `15` | How much audio above the gate makes a clip. Short clips miss more often. |
@@ -239,11 +241,11 @@ a manual rip, and it refuses to act on silence or while a rip is running.
 
 Some things decide whether the result is worth keeping:
 
-- **Line input, not a microphone.** A USB interface such as a Behringer UCA202/UCA222 is a
+- **A line input beats a microphone.** A USB interface such as a Behringer UCA202/UCA222 is a
   line-level, 16-bit, 44.1/48 kHz stereo input: set the `source` option to its PulseAudio
   source (the add-on logs the name at startup, or run `pactl list short sources` in the
-  add-on's terminal). A microphone gives a mono room recording, and the add-on warns when
-  it is about to rip a mono source.
+  add-on's terminal). A microphone — a webcam mic, say — gives a mono room recording, and the
+  add-on warns when it is about to rip a mono source.
 - **The turntable needs a phono preamp** between it and the interface — RCA line level
   with RIAA equalisation. A moving-magnet deck plugged straight in sounds thin, quiet and
   noisy; a deck with a built-in preamp, or a separate phono stage, is what the interface
@@ -403,7 +405,7 @@ style that paints the cover, artist, title and album over the stream.
   anyone on the network the Start/Stop button and the delete links. Reach it from the
   add-on page, or add it to the sidebar.
 - Auto-rip hears the same gate the listener does, so it starts on anything loud enough for
-  long enough — a door slamming three times, a loud conversation near the microphone. Two
+  long enough — a door slamming three times, a loud conversation near the input. Two
   things keep that honest: it only listens while the activity entity is on, and the
   recorder stops at `rip_max_minutes` whatever it thinks it heard.
 - Auto-rip stops on quiet, and a locked run-out groove can keep clicking above the gate
