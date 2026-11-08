@@ -38,7 +38,7 @@ ARTWORK_DIR = Path("/config/www/vinyl-art")
 # How many epoch-named covers to keep beside the fixed `device_name.jpg`.
 ARTWORK_KEEP = 5
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -97,6 +97,17 @@ TRACK_GAP_DEPTH_DB = 18.0
 TRACK_GAP_SECONDS = 1.5
 TRACK_MIN_SECONDS = 10.0
 TRACK_MAX_COUNT = 24
+# Streaming: one ffmpeg turns the live PCM into MP3, and every listener gets the same bytes
+# with ICY metadata blocks mixed in every STREAM_METAINT bytes of audio.
+STREAM_PORT = 8098
+STREAM_METAINT = 16000
+# Chunks of PCM held for the encoder before we start dropping: a slow encoder must never
+# stall the capture that the listener and the rip share.
+STREAM_QUEUE_CHUNKS = 40
+# How much encoded audio is kept for listeners, and how long an unwatched stream keeps
+# running before its ffmpeg is stopped.
+STREAM_BUFFER_BYTES = 512 * 1024
+STREAM_IDLE_STOP_SECONDS = 15.0
 # The web UI is served on this port and reached through Home Assistant ingress (see
 # `ingress_port` in config.yaml); it is never published to the LAN.
 WEB_PORT = 8099
@@ -143,6 +154,8 @@ class Config:
     rip_auto_gain: bool = False
     rip_auto_stop_seconds: int = 20
     rip_split: bool = False
+    stream_enabled: bool = False
+    stream_bitrate: int = 128
 
     def bytes_per_second(self, channels: int = 1) -> int:
         return self.sample_rate * 2 * channels  # signed 16-bit little endian
@@ -180,6 +193,8 @@ def load_config() -> Config:
         rip_auto_gain=bool(raw.get("rip_auto_gain", False)),
         rip_auto_stop_seconds=int(raw.get("rip_auto_stop_seconds", 20)),
         rip_split=bool(raw.get("rip_split", False)),
+        stream_enabled=bool(raw.get("stream_enabled", False)),
+        stream_bitrate=int(raw.get("stream_bitrate", 128)),
     )
 
 
@@ -1298,6 +1313,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
     source = await asyncio.to_thread(find_source, cfg)
     channels = await asyncio.to_thread(source_channels, source)
+    encoder = StreamEncoder(cfg, channels) if cfg.stream_enabled else None
     bytes_per_second = cfg.bytes_per_second(channels)
     listen_bytes = int(bytes_per_second * cfg.listen_seconds)
     prebuffer_bytes = int(bytes_per_second * PREBUFFER_SECONDS)
@@ -1321,6 +1337,8 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
     async def tap(data: bytes) -> None:
         await tape.put(data)
+        if encoder is not None:
+            encoder.push(data)
 
     status: dict[str, Any] = {
         "version": VERSION,
@@ -1341,6 +1359,12 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         "events": [],
         "gain": None,
         "auto": {"enabled": cfg.rip_auto, "holding": False},
+        "stream": {
+            "enabled": cfg.stream_enabled,
+            "clients": 0,
+            "bitrate": cfg.stream_bitrate,
+            "running": False,
+        },
         "rip": {"state": "idle", "file": "", "seconds": 0, "peak_dbfs": -120,
                 "clipped": False, "channels": channels,
                 "sample_rate": cfg.sample_rate, "format": cfg.rip_format},
@@ -1351,6 +1375,11 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         rip_worker(cfg, source, channels, tape, commands, client, status)
     )
     server = asyncio.create_task(web_server(cfg, status, commands))
+    radio = (
+        asyncio.create_task(stream_server(cfg, encoder, status))
+        if encoder is not None
+        else None
+    )
 
     prebuffer = bytearray()
     clip = bytearray()
@@ -1651,6 +1680,8 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         reader.cancel()
         ripper.cancel()
         server.cancel()
+        if radio is not None:
+            radio.cancel()
         if watcher is not None:
             watcher.cancel()
         await session.close()
@@ -1766,6 +1797,14 @@ INDEX_HTML = (
       <thead><tr><th>recording</th><th>size</th><th></th></tr></thead>
       <tbody id="files"><tr><td colspan="3" class="muted">no rips yet</td></tr></tbody>
     </table>
+  </section>
+  <section>
+    <h2>Radio stream</h2>
+    <div class="row"><span>state</span><span id="streamState">off</span></div>
+    <div class="row"><span>listeners</span><span id="streamClients">0</span></div>
+    <div class="row"><span>quality</span><span id="streamBitrate">—</span></div>
+    <p class="muted">Add this as a radio station in Music Assistant:</p>
+    <p><code id="streamUrl">—</code></p>
   </section>
   <section>
     <h2>Event log</h2>
@@ -1896,6 +1935,20 @@ function renderRip(status) {
   $("files").replaceChildren(...rows);
 }
 
+function renderStream(status) {
+  const stream = status.stream || {};
+  $("streamState").textContent = !stream.enabled
+    ? "off — set stream_enabled in the add-on options"
+    : (stream.running ? "live" : "ready — starts when a listener arrives");
+  $("streamClients").textContent = String(stream.clients || 0);
+  $("streamBitrate").textContent = stream.enabled
+    ? (stream.bitrate || 128) + " kbit/s MP3"
+    : "—";
+  $("streamUrl").textContent = stream.enabled
+    ? "http://" + location.hostname + ":8098/stream.mp3"
+    : "—";
+}
+
 function renderEvents(events) {
   const rows = (events || []).slice().reverse().map((event) => {
     const item = document.createElement("li");
@@ -1925,6 +1978,7 @@ function render(status) {
   renderMeter(status);
   renderRip(status);
   renderEvents(status.events);
+  renderStream(status);
 }
 
 async function refresh() {
@@ -2119,6 +2173,328 @@ async def web_server(
             await asyncio.sleep(30)
     finally:
         await runner.cleanup()
+
+
+def icy_title(track: dict[str, Any] | None) -> str:
+    """`Artist - Title` for an ICY StreamTitle, or "" when nothing is named."""
+    if not track:
+        return ""
+    artist = (track.get("artist") or "").strip()
+    title = (track.get("title") or "").strip()
+    if artist and title:
+        return f"{artist} - {title}"[:120]
+    return (artist or title)[:120]
+
+
+def icy_block(title: str) -> bytes:
+    """One ICY metadata block: StreamTitle='…'; padded with zeros to a multiple of 16."""
+    text = "StreamTitle='%s';" % title.replace("'", "").replace(";", ",") if title else ""
+    payload = text.encode("utf-8")
+    blocks = min(255, (len(payload) + 15) // 16)
+    return bytes([blocks]) + payload[: blocks * 16].ljust(blocks * 16, b"\0")
+
+
+class StreamBuffer:
+    """The encoder's MP3 bytes, kept long enough for the clients reading them.
+
+    Listeners are independent: each one has an absolute offset into this buffer, so a slow
+    client misses audio (and is dropped once it falls off the front) rather than holding up
+    the record. Polling beats an Event here — an append between a readiness check and a
+    `clear()` would lose the wakeup, and 20 ms of latency is nothing on a radio stream.
+    """
+
+    def __init__(self, limit: int = STREAM_BUFFER_BYTES) -> None:
+        self.limit = limit
+        self.data = bytearray()
+        self.base = 0  # absolute offset of data[0]
+        self.end = 0  # absolute offset just past the last byte
+
+    def append(self, data: bytes) -> None:
+        self.data.extend(data)
+        self.end += len(data)
+        if len(self.data) > self.limit:
+            drop = len(self.data) - self.limit
+            del self.data[:drop]
+            self.base += drop
+
+    def behind(self, offset: int) -> bool:
+        """True when `offset` has fallen off the front of the buffer."""
+        return offset < self.base
+
+    async def read(self, offset: int) -> tuple[int, bytes]:
+        """Wait for audio past `offset` and return it with the new offset."""
+        while offset >= self.end:
+            await asyncio.sleep(0.02)
+        offset = max(offset, self.base)
+        return self.end, bytes(self.data[offset - self.base :])
+
+
+class StreamEncoder:
+    """One ffmpeg process turning the live PCM into MP3 for radio listeners.
+
+    It runs only while somebody is listening (plus a grace period), and the PCM is *pushed*
+    at it rather than pulled, so a stalled or busy encoder drops audio instead of stalling
+    the capture that the listener and the rip share.
+    """
+
+    def __init__(self, cfg: Config, channels: int) -> None:
+        self.cfg = cfg
+        self.channels = channels
+        self.audio = StreamBuffer()
+        self.clients = 0
+        self.idle_since: float | None = time.monotonic()
+        self.process: asyncio.subprocess.Process | None = None
+        self.feed: "asyncio.Queue[bytes] | None" = None
+        self.tasks: list["asyncio.Task[Any]"] = []
+        self._lock = asyncio.Lock()
+
+    @property
+    def running(self) -> bool:
+        return self.process is not None and self.process.returncode is None
+
+    async def start(self) -> None:
+        async with self._lock:
+            if self.running:
+                return
+            command = [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                str(self.cfg.sample_rate),
+                "-ac",
+                str(self.channels),
+                "-i",
+                "pipe:0",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                f"{self.cfg.stream_bitrate}k",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ]
+            try:
+                self.process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                )
+            except OSError as err:
+                log.error("Could not start ffmpeg for the stream (%s)", err)
+                self.process = None
+                return
+            self.feed = asyncio.Queue(maxsize=STREAM_QUEUE_CHUNKS)
+            self.tasks = [
+                asyncio.create_task(self._feed_encoder()),
+                asyncio.create_task(self._read_encoder()),
+            ]
+            log.info(
+                "Streaming at %d kbit/s MP3 on port %d", self.cfg.stream_bitrate, STREAM_PORT
+            )
+
+    async def stop(self) -> None:
+        async with self._lock:
+            process, self.process = self.process, None
+            self.feed = None
+            tasks, self.tasks = self.tasks, []
+            for task in tasks:
+                task.cancel()
+            if process is None:
+                return
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except (asyncio.TimeoutError, ProcessLookupError, OSError):
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            log.info("Stopped streaming (nobody listening)")
+
+    def push(self, data: bytes) -> None:
+        """Hand a chunk of PCM to the encoder; never blocks and never raises."""
+        feed = self.feed
+        if feed is None or not self.running:
+            return
+        try:
+            feed.put_nowait(data)
+        except asyncio.QueueFull:
+            pass
+
+    async def _feed_encoder(self) -> None:
+        process = self.process
+        if process is None or process.stdin is None:
+            return
+        feed = self.feed
+        assert feed is not None
+        try:
+            while True:
+                data = await feed.get()
+                process.stdin.write(data)
+                await process.stdin.drain()
+        except (asyncio.CancelledError, OSError):
+            pass
+
+    async def _read_encoder(self) -> None:
+        process = self.process
+        if process is None or process.stdout is None:
+            return
+        try:
+            while True:
+                data = await process.stdout.read(4096)
+                if not data:
+                    break
+                self.audio.append(data)
+        except (asyncio.CancelledError, OSError):
+            pass
+
+
+async def stream_server(
+    cfg: Config, encoder: StreamEncoder, status: dict[str, Any]
+) -> None:
+    """A radio stream for Music Assistant: live MP3 with ICY metadata.
+
+    This one is on a published port rather than behind ingress, because the listener is
+    another add-on (Music Assistant), not a browser that can carry Home Assistant's auth.
+    It therefore serves audio and nothing else — no control, no files.
+    """
+
+    async def index(_request: web.Request) -> web.StreamResponse:
+        lines = [
+            "Vinyl Ear — %d kbit/s MP3" % cfg.stream_bitrate,
+            "stream:    /stream.mp3",
+            "playlist:  /stream.m3u",
+            "now:       /now-playing",
+            "playing:   %s" % (icy_title(status.get("track")) or "nothing named yet"),
+        ]
+        return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
+
+    async def playlist(_request: web.Request) -> web.StreamResponse:
+        return web.Response(text="#EXTM3U\nstream.mp3\n", content_type="audio/x-mpegurl")
+
+    async def now_playing(_request: web.Request) -> web.StreamResponse:
+        return web.json_response(
+            {
+                "title": icy_title(status.get("track")),
+                "track": status.get("track"),
+                "listeners": encoder.clients,
+            }
+        )
+
+    async def stream(request: web.Request) -> web.StreamResponse:
+        await encoder.start()
+        response = web.StreamResponse(
+            headers={
+                "Content-Type": "audio/mpeg",
+                "icy-name": "Vinyl Ear",
+                "icy-genre": "Vinyl",
+                "icy-br": str(cfg.stream_bitrate),
+                "icy-metaint": str(STREAM_METAINT),
+                "icy-pub": "0",
+                "Cache-Control": "no-cache, no-store",
+                "Connection": "keep-alive",
+            }
+        )
+        await response.prepare(request)
+        encoder.clients += 1
+        encoder.idle_since = None
+        offset = encoder.audio.end  # join at the live edge
+        sent = 0
+        log.info("Stream listener joined (%d now)", encoder.clients)
+        try:
+            while True:
+                if request.transport is None or request.transport.is_closing():
+                    log.info("Stream listener went away")
+                    break
+                if encoder.audio.behind(offset):
+                    # So far behind that the audio is gone; a reconnect starts afresh.
+                    log.info("Dropping a stream listener that fell behind")
+                    break
+                try:
+                    offset, data = await asyncio.wait_for(
+                        encoder.audio.read(offset), timeout=20.0
+                    )
+                except asyncio.TimeoutError:
+                    if not encoder.running:
+                        log.info("Stream encoder stopped; closing the listener")
+                        break
+                    continue
+                view = memoryview(data)
+                while view:
+                    room = STREAM_METAINT - sent % STREAM_METAINT
+                    piece = view[:room]
+                    await response.write(piece)
+                    sent += len(piece)
+                    view = view[room:]
+                    if sent % STREAM_METAINT == 0:
+                        await response.write(icy_block(icy_title(status.get("track"))))
+        except (asyncio.CancelledError, ConnectionResetError, RuntimeError):
+            pass
+        finally:
+            encoder.clients -= 1
+            if encoder.clients <= 0:
+                encoder.clients = 0
+                encoder.idle_since = time.monotonic()
+            log.info("Stream listener left (%d now)", encoder.clients)
+        return response
+
+    async def reaper() -> None:
+        """Stop ffmpeg when nobody has been listening for a while."""
+        while not stop.is_set():
+            status["stream"] = {
+                "enabled": True,
+                "clients": encoder.clients,
+                "bitrate": cfg.stream_bitrate,
+                "running": encoder.running,
+            }
+            if encoder.clients > 0:
+                encoder.idle_since = None
+            elif encoder.idle_since is None:
+                encoder.idle_since = time.monotonic()
+            elif time.monotonic() - encoder.idle_since >= STREAM_IDLE_STOP_SECONDS:
+                await encoder.stop()
+                encoder.idle_since = None
+            await asyncio.sleep(2.0)
+
+    app = web.Application()
+    app.add_routes(
+        [
+            web.get("/", index),
+            web.get("/stream.mp3", stream),
+            web.get("/stream.m3u", playlist),
+            web.get("/now-playing", now_playing),
+        ]
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", STREAM_PORT)
+    try:
+        try:
+            await site.start()
+        except OSError as err:
+            log.error("Cannot serve the stream on port %d (%s)", STREAM_PORT, err)
+            return
+        log.info(
+            "Stream listening on port %d (http://<home-assistant>:%d/stream.mp3)",
+            STREAM_PORT,
+            STREAM_PORT,
+        )
+        await reaper()
+    finally:
+        status["stream"] = {
+            "enabled": cfg.stream_enabled,
+            "clients": 0,
+            "bitrate": cfg.stream_bitrate,
+            "running": False,
+        }
+        await runner.cleanup()
+        await encoder.stop()
 
 
 def handle_signal(signum: int, _frame: Any) -> None:

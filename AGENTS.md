@@ -8,7 +8,7 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.8.0**.
+what the startup banner prints). Current: **0.9.0**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
@@ -16,7 +16,8 @@ vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true
 vinyl_ear/Dockerfile       python:3.11-slim + ffmpeg + pulseaudio-utils
 vinyl_ear/app/main.py      everything: capture, noise gate, Shazam, artwork cache,
                            MQTT discovery, rip recorder, run loop, the ingress web UI
-                           (aiohttp server + the page it serves, as one string)
+                           (aiohttp server + the page it serves, as one string) and the
+                           radio stream (a second aiohttp server + one ffmpeg)
 vinyl_ear/run.sh           sets PULSE_SERVER to /run/audio/pulse.sock when present
 lovelace/*.yaml            card/view YAML that is pasted or patched into Lovelace
 repository.yaml            makes this repo an add-on repository
@@ -233,6 +234,21 @@ patch the storage file from those, do not hand-edit the JSON.
     track files. Wait for the `Split …`/`No track gaps` event instead. In the add-on itself
     the same window is why the web UI can show idle while tracks are still appearing.
 
+15. **ICY metadata is counted per listener, in bytes of audio actually sent.** `metaint` is
+    announced once, in the response header, and then the stream must put a metadata block at
+    exactly every `STREAM_METAINT`-th *audio* byte — not per MP3 frame (we never see frame
+    boundaries; ffmpeg's output is an opaque pipe) and not on a timer (a timer drifts against
+    the byte count and the client reads garbage). Two listeners also start at different
+    offsets, so the counter cannot be shared. Get this wrong and players either resync
+    constantly or show no title at all; `ffprobe` on the extracted audio is what proves the
+    bytes between blocks are still decodable.
+16. **The stream tap must not be able to stall the capture.** `audio_reader`'s `tap` awaits the
+    rip queue and then *pushes* to the encoder with `put_nowait`. If the encoder is fed with a
+    blocking `await`, one ffmpeg hiccup (or a full queue because ffmpeg died) stops `parec`
+    being read, which stops Shazam, the gate, the auto-rip and the rip itself — the whole
+    add-on freezes with no obvious symptom. Dropping audio for the stream is always the right
+    trade.
+
 ## Ripping
 
 `RipRecorder` + `rip_worker()` write WAV as the chunks arrive (a `wave` handle, patched on
@@ -282,6 +298,34 @@ Three things sit on top of that, and each has one owner so there is no second op
   whole-side file. It runs *after* `finish()` and after the idle report, so a client polling
   for `state == "idle"` can see idle before the tracks appear — tests have to wait for the
   "Split …"/"No track gaps" event, not for idle.
+
+## Streaming
+
+`StreamEncoder` + `stream_server()` give the capture a second life as a radio station, on
+`STREAM_PORT` (8098), **outside ingress**. That is the whole reason it is a separate server:
+Music Assistant is another add-on, so it cannot present Home Assistant's session, and an
+ingress URL is not something MA can be given. `ports: 8098/tcp: 8098` is therefore declared in
+`config.yaml`, and the server only listens when `stream_enabled` is on. The number lives in
+three places that must agree: `STREAM_PORT`, the `ports:`/`ports_description:` entries, and
+the URL the page prints (`location.hostname` + `:8098`).
+
+- One ffmpeg per *listening session*: `-f s16le -ar <rate> -ac <channels> -i pipe:0` →
+  `libmp3lame -b:a <stream_bitrate>k` → `pipe:1`. It starts on the first connection and is
+  stopped by a reaper after `STREAM_IDLE_STOP_SECONDS` with nobody attached, so an armed but
+  unlistened stream costs nothing.
+- PCM reaches it through the same `tap` the rip uses, but with `push()` — `put_nowait` into a
+  `STREAM_QUEUE_CHUNKS` queue that silently drops when full. The capture is shared with Shazam
+  and the rip; a slow encoder must never be able to stall it.
+- Encoded bytes go into one `StreamBuffer` with absolute offsets, and each listener keeps its
+  own offset, so listeners are independent: a slow one misses audio and is dropped once it
+  falls off the front of the buffer rather than holding anyone up.
+- **ICY metadata** is written per listener, not per stream: `icy-metaint` counts the *audio
+  bytes sent to that client*, and every time the count crosses a multiple of `STREAM_METAINT`
+  an `icy_block()` follows — `StreamTitle='Artist - Title';`, zero padded, length in 16-byte
+  groups. The title is read from `status["track"]` at that moment, so a newly named track
+  appears in the next block without any plumbing between `commit()` and the server.
+- The extra endpoints are for humans and for checking: `/` (a text summary), `/stream.m3u`,
+  `/now-playing` (JSON). Nothing on this port changes any state.
 
 ## Web interface
 
@@ -390,6 +434,16 @@ wrong:
   audio at all; `split_rip()` needs real ffmpeg, so write a 36 s WAV, cut at 12/24 and probe
   the pieces with `ffprobe`. Remember gotcha 14: wait for the `Split …` event, not for idle.
 
+The stream is testable end to end without a turntable, because ffmpeg is on the box: build a
+`StreamEncoder`, start `stream_server(cfg, encoder, status)` (move `STREAM_PORT` first), push
+synthetic chunks at it from a task, and read `/stream.mp3` with a `ClientSession`. The response
+must carry `icy-metaint`; every `metaint` bytes of body must be followed by a length byte and
+that many 16-byte groups. Strip those groups and `ffprobe` what is left — it must say `mp3
+44100 2ch` — and changing `status["track"]` must change the next block's `StreamTitle`. Two
+traps: a listener that closes is only noticed on the next write, so poll `encoder.clients`
+instead of asserting immediately after the response context exits; and `push()` drops silently
+while ffmpeg is not running, so feed *after* the first connection rather than before it.
+
 ## Release checklist
 
 1. Bump `VERSION` in `vinyl_ear/app/main.py` and `version:` in `vinyl_ear/config.yaml`.
@@ -431,6 +485,10 @@ wrong:
   no `ports:` mapping and no `webui:` — a published 8099 would let anyone on the LAN start,
   stop and delete rips. If it ever has to be exposed, put it behind HA's auth proxy rather
   than adding a password to the page.
+- The stream is the one deliberate exception: port 8098 is published because Music Assistant
+  is not a browser and cannot carry an ingress session. It serves audio and the current title
+  and nothing else, but it is unauthenticated live room audio, which is why it is off unless
+  `stream_enabled` says otherwise.
 - Shazam here is reverse engineered (`shazamio`): no key, no quota, but it can break.
   ACRCloud or AudD would slot in behind the same interface.
 - Obscure and private pressings are simply unknown to Shazam. Rather than holding the last

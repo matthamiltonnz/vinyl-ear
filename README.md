@@ -190,6 +190,8 @@ sampled four times a second rather than in bursts:
 | `rip_auto_gain` | `false` | Before an auto rip starts, move the capture gain so the record's peak lands near -6 dBFS (the pre-roll is scaled to match, so the side stays level). |
 | `rip_auto_stop_seconds` | `20` | How quiet, and for how long, counts as "the side has ended". The run-out groove makes noise, so shorter is usually worse. |
 | `rip_split` | `false` | Cut a finished side at its silences into `<name>-01`, `<name>-02`, … The whole-side file is kept. |
+| `stream_enabled` | `false` | Serve the live capture as an MP3 radio stream on port 8098, with ICY metadata, for Music Assistant. Audio only. |
+| `stream_bitrate` | `128` | The stream's MP3 bitrate in kbit/s (64-192). The capture itself stays 16-bit; only the stream is lossy. |
 
 ## Ripping a record
 
@@ -248,6 +250,41 @@ Some things decide whether the result is worth keeping:
   ffmpeg -i side-a.flac -af silencedetect=noise=-40dB:d=1 -f null -  # where the gaps are
   ffmpeg -i side-a.flac -ss 0 -to 212 -c copy track-01.flac          # then cut them out
   ```
+## Stream it to Music Assistant
+
+Set `stream_enabled` and the add-on also serves the live capture as a radio stream — the same
+PCM the listener hears and the ripper records, encoded to MP3 by ffmpeg — so Music Assistant
+(or anything else that plays an HTTP stream) can put the turntable in the speaker group:
+
+```
+http://<home-assistant>:8098/stream.mp3      # the stream
+http://<home-assistant>:8098/stream.m3u      # a playlist that points at it
+http://<home-assistant>:8098/now-playing     # the ICY title, as JSON
+```
+
+In Music Assistant: **Settings → Providers → Add Provider → Radio**, add a radio station,
+paste the `.mp3` URL and call it *Vinyl Ear*. Home Assistant's own `media_player` can play the
+same URL.
+
+The stream carries the detected track as **ICY metadata** (`icy-metaint` blocks with
+`StreamTitle='Artist - Title';`), which is what a radio station uses to show what is playing —
+so Music Assistant's now-playing follows Shazam within a second or so, and blanks itself when
+nothing is named. That also means the metadata comes from the same answer the sensor publishes,
+not a second guess.
+
+Things worth knowing:
+
+- The stream is on **port 8098, published to your network** — it is the one part of the add-on
+  that cannot hide behind ingress, because the listener is another add-on rather than a browser
+  with Home Assistant's session. It serves audio only: no controls, no files, no state changes.
+  Anyone on your LAN can listen, so turn `stream_enabled` off if that is not what you want.
+- ffmpeg only runs while somebody is listening (and for `STREAM_IDLE_STOP_SECONDS` after),
+  so an idle stream costs nothing but the open socket.
+- Latency is about a second — MP3 framing plus the encoder's buffer. Fine for "what is playing
+  in the kitchen", not a monitoring path.
+- Bitrate is `stream_bitrate` (128 kbit/s by default). The capture itself stays 16-bit,
+  44.1/48 kHz; this is the only lossy step in the add-on and it only feeds the stream.
+
 ## Web interface
 
 The add-on serves its own page: **Open Web UI** on the add-on page (and in the sidebar if you
