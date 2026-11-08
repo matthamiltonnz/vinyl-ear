@@ -1,23 +1,17 @@
 # Vinyl Ear
 
-Identifies the record spinning on the turntable by listening to a room microphone and
-asking Shazam, then publishes the result to Home Assistant over MQTT (discovery).
+Identifies the record spinning on the turntable by listening to a microphone or any capture
+device connected to Home Assistant, asking Shazam, and publishing the answer over MQTT with
+discovery — so `sensor.vinyl_ear_<device_name>_now_playing` carries the artist, title, album,
+year and sleeve, and `binary_sensor.…_audio_detected` says whether the input is live. The same
+capture can be recorded losslessly, a side at a time, and served as a live radio stream.
 
-See the [repository README](../README.md) for the full story, options and a Lovelace
-card. The short version:
+```
+mic/line ──▶ noise gate ──▶ 15 s clip ──▶ Shazam (shazamio) ──▶ MQTT discovery
+```
 
-1. Set the microphone gain so music is audible — e.g.
-   `pactl set-source-volume <source> 45%`, with `<source>` from
-   `pactl list short sources` (skip the `.monitor` ones).
-2. Install the add-on, fill in `mqtt_user` / `mqtt_password`, start it.
-3. Watch the log: it prints the PulseAudio source it picked and every match.
-4. A new device **Vinyl Ear (&lt;device_name&gt;)** appears under *Settings → Devices &
-   Services → MQTT* with `sensor.vinyl_ear_<device_name>_now_playing` and
-   `binary_sensor.vinyl_ear_<device_name>_audio_detected`. With the default
-   `device_name: turntable` those read `sensor.vinyl_ear_turntable_now_playing` and
-   `binary_sensor.vinyl_ear_turntable_audio_detected` — the name is whatever you set in
-   the add-on configuration, and it also names the MQTT topics under
-   `vinyl_ear/<device_name>/`.
-
-If the log says no capture source was found, fill in the `source` option with a name
-from `pactl list short sources` (skip anything ending in `.monitor`).
+The **Documentation** tab beside this page is the add-on's own guide (install, options, the web
+interface, ripping and the stream). The [repository
+README](https://github.com/matthamiltonnz/vinyl-ear#readme) has the long version, including why
+the noise gate and the track splitting behave the way they do and the Lovelace cards that show
+the sleeve next to the camera.
