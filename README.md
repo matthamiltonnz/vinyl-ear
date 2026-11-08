@@ -189,7 +189,8 @@ sampled four times a second rather than in bursts:
 
 ## Ripping a record
 
-Switch on the **Rip record** switch (MQTT discovery creates `switch.<device>_rip`) and drop
+Switch on the **Rip record** switch (MQTT discovery creates `switch.<device>_rip`) — or press
+**Start a rip** in the add-on's web interface, which is the same command — and drop
 the needle; switch it off when the side ends. The listener keeps running while it records —
 it is the same audio — so names keep appearing in the dashboard as the side plays. The
 finished file is `/share/vinyl-rips/<device_name>-<YYYYmmdd-HHMMSS>.flac`, and the switch's
@@ -222,6 +223,29 @@ Some things decide whether the result is worth keeping:
   ffmpeg -i side-a.flac -af silencedetect=noise=-40dB:d=1 -f null -  # where the gaps are
   ffmpeg -i side-a.flac -ss 0 -to 212 -c copy track-01.flac          # then cut them out
   ```
+## Web interface
+
+The add-on serves its own page: **Open Web UI** on the add-on page (and in the sidebar if you
+tick *Show in sidebar*). It runs on Home Assistant ingress, so there is no port to publish and
+no second password — Home Assistant authenticates you and the page stays inside your
+installation.
+
+- **Shazam detection** — the artist, title, album and sleeve currently published, plus the
+  parts of the decision Home Assistant cannot show: the live level in dBFS against the gate,
+  a ~30 s level history (green once a chunk is above the gate), the gate and the measured
+  room floor, whether audio is above the gate, how many lookups Shazam has refused, how long
+  ago the last lookup was and what it answered.
+- **Rip** — state, elapsed time, peak level and the file being written, a Start/Stop button
+  that does exactly what the MQTT switch does, and the finished recordings in `rip_dir` with
+  their sizes. Each can be played, downloaded or deleted. Files are addressed by name and
+  only inside `rip_dir`, so nothing else on the disk is reachable.
+- **Event log** — the last 40 things that happened: recognitions, refusals, gate changes and
+  rip starts and stops. It is the quickest way to tell "the record is not being heard" from
+  "it is heard but Shazam does not know it".
+
+The page is served by the add-on's own process (aiohttp, port 8099 inside the container) and
+reads the state the listener already publishes, so it shows what Home Assistant sees rather
+than a second opinion.
 
 ## Lovelace card
 
@@ -269,3 +293,7 @@ style that paints the cover, artist, title and album over the stream.
   no "Nothing playing" line, no "track not identified" placeholder, just the camera.
 - Recognition requests only happen while the room is above the noise gate, at most
   once every `poll_seconds`.
+- The web interface is reachable through Home Assistant ingress only. No port is
+  published: the page has no password of its own, so exposing it to the LAN would hand
+  anyone on the network the Start/Stop button and the delete links. Reach it from the
+  add-on page, or add it to the sidebar.

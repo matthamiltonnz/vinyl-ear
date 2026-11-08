@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 import paho.mqtt.client as mqtt
+from aiohttp import web
 from shazamio import Shazam
 
 OPTIONS_FILE = Path(os.environ.get("VINYL_EAR_OPTIONS", "/data/options.json"))
@@ -36,7 +37,7 @@ ARTWORK_DIR = Path("/config/www/vinyl-art")
 # How many epoch-named covers to keep beside the fixed `device_name.jpg`.
 ARTWORK_KEEP = 5
 ALBUM_STORE = Path("/data/albums.json")
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 FULL_SCALE = 32768.0
 CHUNK_SECONDS = 0.25
 GAP_SECONDS = 2.0
@@ -71,6 +72,13 @@ MAX_COOLDOWN_SECONDS = 300.0
 HEARTBEAT_SECONDS = 300.0
 # How often a running rip publishes its elapsed time and peak level.
 RIP_REPORT_SECONDS = 10.0
+# How long the rip worker waits for a chunk before looking at its command queue again.
+RIP_POLL_SECONDS = 0.5
+# The web UI is served on this port and reached through Home Assistant ingress (see
+# `ingress_port` in config.yaml); it is never published to the LAN.
+WEB_PORT = 8099
+# How many chunk levels the UI keeps for its level history.
+WEB_LEVELS = 120
 # Chunks buffered between the capture and the rip writer: 2 s of audio, enough to cover a
 # slow disk or a FLAC encode without stalling the listener for long.
 RIP_QUEUE_CHUNKS = 8
@@ -687,6 +695,13 @@ async def recognise(
     return parse_track(response or {}, cfg.device_name)
 
 
+def note(status: dict[str, Any], text: str) -> None:
+    """Add one line to the event log the web UI shows."""
+    events = status.setdefault("events", [])
+    events.append((time.strftime("%H:%M:%S"), text[:160]))
+    del events[:-40]
+
+
 class RipRecorder:
     """Capture every chunk to disk, in the source's own channel count and rate.
 
@@ -795,32 +810,29 @@ async def rip_worker(
     tape: "asyncio.Queue[bytes]",
     commands: "asyncio.Queue[str]",
     client: mqtt.Client,
+    status: dict[str, Any],
 ) -> None:
-    """Record while a rip is running, on MQTT commands; ignore the tape in between."""
+    """Record while a rip is running, on MQTT or web commands; ignore the tape otherwise."""
     state_topic = f"{cfg.base_topic}/rip/state"
     info_topic = f"{cfg.base_topic}/rip"
     recorder = RipRecorder(cfg, channels)
     last_report = 0.0
 
     def report(retain: bool = False) -> None:
+        current = recorder.wav_path if recorder.recording else recorder.file
+        payload = {
+            "state": "recording" if recorder.recording else "idle",
+            "file": str(current) if current else "",
+            "seconds": round(recorder.seconds),
+            "peak_dbfs": round(recorder.peak_dbfs) if recorder.peak else -120,
+            "clipped": recorder.peak >= 32767,
+            "channels": channels,
+            "sample_rate": cfg.sample_rate,
+            "format": cfg.rip_format,
+        }
+        status["rip"] = payload
         publish(client, state_topic, "ON" if recorder.recording else "OFF", retain=retain)
-        publish(
-            client,
-            info_topic,
-            json.dumps(
-                {
-                    "state": "recording" if recorder.recording else "idle",
-                    "file": str(recorder.file) if recorder.file else "",
-                    "seconds": round(recorder.seconds),
-                    "peak_dbfs": round(recorder.peak_dbfs) if recorder.peak else -120,
-                    "clipped": recorder.peak >= 32767,
-                    "channels": channels,
-                    "sample_rate": cfg.sample_rate,
-                    "format": cfg.rip_format,
-                }
-            ),
-            retain=retain,
-        )
+        publish(client, info_topic, json.dumps(payload), retain=retain)
 
     def stop_rip() -> None:
         seconds = recorder.seconds
@@ -830,7 +842,10 @@ async def rip_worker(
         report(retain=True)
         if path is None:
             log.info("Rip stopped before anything was written")
+            note(status, "Rip stopped before anything was written")
             return
+        note(status, "Rip finished: %s (%.0fs, peak %.0f dBFS%s)" % (
+            path.name, seconds, peak, ", CLIPPED" if clipped else ""))
         log.info(
             "Rip finished: %s (%.0fs, peak %.0f dBFS%s)",
             path,
@@ -854,6 +869,9 @@ async def rip_worker(
                         else:
                             last_report = 0.0
                             report(retain=True)
+                            note(status, "Rip started: %s (%d ch, %d Hz, %s)" % (
+                                recorder.wav_path.name, channels, cfg.sample_rate,
+                                cfg.rip_format))
                             log.info(
                                 "Ripping to %s (%d ch, %d Hz, %s)",
                                 recorder.wav_path,
@@ -869,7 +887,17 @@ async def rip_worker(
                                 )
                     elif command in {"STOP", "OFF"} and recorder.recording:
                         stop_rip()
-                data = await tape.get()
+                if recorder.recording and recorder.seconds >= cfg.rip_max_minutes * 60:
+                    log.info("Rip reached the %d minute limit; stopping", cfg.rip_max_minutes)
+                    note(status, "Rip reached the %d minute limit" % cfg.rip_max_minutes)
+                    stop_rip()
+                try:
+                    data = tape.get_nowait()
+                except asyncio.QueueEmpty:
+                    # Nothing to record: wait a moment so a STOP still gets served when
+                    # the capture stream has gone quiet or away.
+                    await asyncio.sleep(RIP_POLL_SECONDS)
+                    continue
                 if not recorder.recording:
                     continue
                 recorder.write(data)
@@ -877,9 +905,6 @@ async def rip_worker(
                 if now - last_report >= RIP_REPORT_SECONDS:
                     last_report = now
                     report()
-                if recorder.seconds >= cfg.rip_max_minutes * 60:
-                    log.info("Rip reached the %d minute limit; stopping", cfg.rip_max_minutes)
-                    stop_rip()
             except asyncio.CancelledError:
                 raise
             except Exception as err:  # noqa: BLE001 - a rip must not kill the listener
@@ -936,8 +961,33 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     async def tap(data: bytes) -> None:
         await tape.put(data)
 
+    status: dict[str, Any] = {
+        "version": VERSION,
+        "device": cfg.device_name,
+        "source": source,
+        "channels": channels,
+        "sample_rate": cfg.sample_rate,
+        "gate": cfg.noise_gate_db,
+        "threshold": cfg.noise_gate_db,
+        "floor": None,
+        "level": None,
+        "levels": [],
+        "playing": False,
+        "failures": 0,
+        "last_lookup": None,
+        "last_answer": None,
+        "track": None,
+        "events": [],
+        "rip": {"state": "idle", "file": "", "seconds": 0, "peak_dbfs": -120,
+                "clipped": False, "channels": channels,
+                "sample_rate": cfg.sample_rate, "format": cfg.rip_format},
+    }
+
     reader = asyncio.create_task(audio_reader(cfg, source, queue, channels, tap))
-    ripper = asyncio.create_task(rip_worker(cfg, channels, tape, commands, client))
+    ripper = asyncio.create_task(
+        rip_worker(cfg, channels, tape, commands, client, status)
+    )
+    server = asyncio.create_task(web_server(cfg, status, commands))
 
     prebuffer = bytearray()
     clip = bytearray()
@@ -983,6 +1033,10 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
         track["artwork"] = await cache_artwork(session, remote_artwork, cfg.device_name)
         track["artwork_remote"] = remote_artwork
         last_track = track
+        status["track"] = track
+        status["last_answer"] = track.get("display") or track.get("title") or ""
+        note(status, "Now playing: %s - %s (%s)" % (
+            track["artist"] or "?", track["title"] or "?", track["album"] or "unknown album"))
         publish(client, state_topic, json.dumps(track))
         log.info(
             "Now playing: %s - %s (%s, %s)",
@@ -1000,14 +1054,18 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             if not active["active"]:
                 if playing:
                     playing = False
+                    status["playing"] = False
                     publish(client, playing_topic, "OFF")
                 if current_key is not None:
                     current_key = None
                     last_track = None
+                    status["track"] = None
                     recent.clear()
                     state_is_unidentified = False
                     publish(client, state_topic, json.dumps(idle_track(cfg.device_name)))
                     log.info("%s is off — cleared the now playing state", cfg.active_entity)
+                    note(status, "%s is off — cleared the now playing state"
+                         % cfg.active_entity)
                 clip = bytearray()
                 last_loud_at = now
                 continue
@@ -1015,6 +1073,10 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
             level = chunk_level(data)
             levels.append(level)
             floor_levels.append(level)
+            status["level"] = round(level, 1)
+            status["levels"] = (status["levels"] + [round(level, 1)])[-WEB_LEVELS:]
+            status["failures"] = failures
+            status["threshold"] = threshold
 
             if now - last_calibration >= CALIBRATION_SECONDS:
                 last_calibration = now
@@ -1028,6 +1090,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 )
                 if calibrated is not None:
                     floor, wanted = calibrated
+                    status["floor"] = round(floor, 1)
                     if abs(wanted - threshold) >= 1.0:
                         threshold = wanted
                         log.info(
@@ -1036,6 +1099,8 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                             floor,
                             threshold,
                         )
+                        note(status, "Gate moved to %.0f dBFS (floor %.0f dBFS)" % (
+                            threshold, floor))
 
             gap = last_loud_at is None or (now - last_loud_at) >= GAP_SECONDS
 
@@ -1055,6 +1120,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 last_loud_at = now
                 if not playing:
                     playing = True
+                    status["playing"] = True
                     publish(client, playing_topic, "ON")
             else:
                 if last_loud_at is None:
@@ -1062,6 +1128,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 quiet_for = now - last_loud_at
                 if playing and quiet_for >= SILENCE_DEBOUNCE_SECONDS:
                     playing = False
+                    status["playing"] = False
                     publish(client, playing_topic, "OFF")
                 if quiet_for >= GATE_HOLD_SECONDS:
                     # A real gap, not the quiet bar of the track that is playing.
@@ -1097,6 +1164,10 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 log.info(
                     "Silent for %ss — cleared the now playing state", cfg.silence_clear_seconds
                 )
+                status["track"] = None
+                status["last_answer"] = None
+                note(status, "Silent for %ss — cleared the now playing state"
+                     % cfg.silence_clear_seconds)
 
             cooldown = (
                 0.0
@@ -1107,6 +1178,7 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
                 last_attempt_at = now
                 new_segment = False
                 track = await recognise(shazam, cfg, bytes(clip[:listen_bytes]), channels)
+                status["last_lookup"] = time.time()
                 clip = bytearray()
                 last_loud_at = time.monotonic()
                 while not queue.empty():
@@ -1115,6 +1187,8 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
 
                 if track is None:
                     failures += 1
+                    status["last_answer"] = None
+                    note(status, "Heard audio (%.0f dBFS) but Shazam did not recognise it" % level)
                     log.info(
                         "Heard audio (%.0f dBFS) but Shazam did not recognise it", level
                     )
@@ -1163,9 +1237,451 @@ async def run(cfg: Config, client: mqtt.Client) -> None:
     finally:
         reader.cancel()
         ripper.cancel()
+        server.cancel()
         if watcher is not None:
             watcher.cancel()
         await session.close()
+
+
+INDEX_HTML = (
+    """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vinyl Ear</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0f1217; color: #e7eaf0;
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap;
+           padding: 14px 20px; background: #161b23; border-bottom: 1px solid #222a36; }
+  header h1 { margin: 0; font-size: 1.15rem; letter-spacing: .02em; }
+  .meta { font-size: .8rem; opacity: .6; }
+  main { display: grid; gap: 16px; padding: 16px 20px 32px;
+         grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); }
+  section { background: #161b23; border: 1px solid #222a36; border-radius: 14px;
+            padding: 16px; }
+  h2 { margin: 0 0 12px; font-size: .78rem; text-transform: uppercase;
+       letter-spacing: .1em; opacity: .55; }
+  .track { display: flex; gap: 14px; align-items: center; min-height: 84px; }
+  .cover { width: 84px; height: 84px; border-radius: 10px; object-fit: cover;
+           background: #212936; flex: 0 0 auto; }
+  .artist { font-size: 1.1rem; font-weight: 600; }
+  .line { font-size: .9rem; opacity: .7; margin-top: 3px; }
+  .meter { position: relative; height: 22px; margin: 14px 0 8px; border-radius: 7px;
+           background: #0b0e13; overflow: hidden; }
+  .fill { position: absolute; inset: 0 auto 0 0; width: 0;
+          background: linear-gradient(90deg, #2e7d32, #9ccc65 55%, #fdd835 80%, #e53935);
+          transition: width .12s linear; }
+  .gate { position: absolute; top: 0; bottom: 0; width: 2px; background: #e53935; }
+  .spark { display: flex; align-items: flex-end; gap: 2px; height: 46px; margin-top: 6px; }
+  .spark span { flex: 1 1 auto; background: #3b5b8c; border-radius: 1px 1px 0 0;
+                min-height: 1px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; font-size: .88rem;
+         padding: 4px 0; border-bottom: 1px solid #1d2430; }
+  .row:last-child { border-bottom: 0; }
+  .row span:first-child { opacity: .6; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: .78rem;
+          background: #2a3446; }
+  .pill.on { background: #1b5e20; }
+  .pill.warn { background: #7f4f00; }
+  button { font: inherit; border: 0; border-radius: 10px; padding: 9px 18px; cursor: pointer;
+           background: #2b6cb0; color: #fff; }
+  button.stop { background: #b02b2b; }
+  button:disabled { opacity: .45; cursor: default; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; margin-top: 12px; }
+  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #1d2430; }
+  th { font-weight: 500; opacity: .55; font-size: .78rem; }
+  td.actions { text-align: right; white-space: nowrap; }
+  a { color: #8ab4f8; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .del { background: none; color: #ef9a9a; padding: 2px 6px; }
+  ul.events { list-style: none; margin: 0; padding: 0; font-size: .84rem;
+              max-height: 240px; overflow-y: auto; }
+  ul.events li { padding: 4px 0; border-bottom: 1px solid #1d2430; opacity: .85; }
+  ul.events time { opacity: .5; margin-right: 8px; font-variant-numeric: tabular-nums; }
+  .muted { opacity: .45; font-size: .85rem; }
+</style>
+</head>
+"""
+
+    """<body>
+<header>
+  <h1>Vinyl Ear</h1>
+  <span class="meta" id="meta">connecting…</span>
+</header>
+<main>
+  <section>
+    <h2>Shazam detection</h2>
+    <div class="track">
+      <img class="cover" id="cover" alt="" hidden>
+      <div>
+        <div class="artist" id="artist">—</div>
+        <div class="line" id="title"></div>
+        <div class="line" id="album"></div>
+      </div>
+    </div>
+    <div class="meter">
+      <div class="fill" id="fill"></div>
+      <div class="gate" id="gateMark"></div>
+    </div>
+    <div class="spark" id="spark"></div>
+    <div class="row"><span>level</span><span id="level">—</span></div>
+    <div class="row"><span>gate / measured floor</span><span id="gates">—</span></div>
+    <div class="row"><span>audio above gate</span><span id="playing">—</span></div>
+    <div class="row"><span>refused lookups</span><span id="failures">—</span></div>
+    <div class="row"><span>last lookup</span><span id="lookup">—</span></div>
+    <div class="row"><span>last answer</span><span id="answer">—</span></div>
+  </section>
+  <section>
+    <h2>Rip</h2>
+    <div class="row"><span>state</span><span><span class="pill" id="ripState">idle</span></span></div>
+    <div class="row"><span>elapsed</span><span id="ripElapsed">—</span></div>
+    <div class="row"><span>peak</span><span id="ripPeak">—</span></div>
+    <div class="row"><span>file</span><span id="ripFile">—</span></div>
+    <p><button id="ripButton">Start a rip</button></p>
+    <table>
+      <thead><tr><th>recording</th><th>size</th><th></th></tr></thead>
+      <tbody id="files"><tr><td colspan="3" class="muted">no rips yet</td></tr></tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Event log</h2>
+    <ul class="events" id="events"><li class="muted">nothing yet</li></ul>
+  </section>
+</main>
+"""
+
+    """<script>
+const $ = (id) => document.getElementById(id);
+const FLOOR_DB = -60;
+let ripBusy = false;
+
+function pct(value) {
+  if (value === null || value === undefined) return 0;
+  return Math.max(0, Math.min(100, ((value - FLOOR_DB) / -FLOOR_DB) * 100));
+}
+function db(value) {
+  return value === null || value === undefined ? "—" : Math.round(value) + " dBFS";
+}
+function ago(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  if (seconds < 90) return seconds + " s ago";
+  if (seconds < 5400) return Math.round(seconds / 60) + " min ago";
+  return (seconds / 3600).toFixed(1) + " h ago";
+}
+function clock(seconds) {
+  const total = Math.max(0, Math.round(seconds || 0));
+  return Math.floor(total / 60) + ":" + String(total % 60).padStart(2, "0");
+}
+function size(bytes) {
+  return bytes >= 1048576
+    ? (bytes / 1048576).toFixed(1) + " MB"
+    : Math.round(bytes / 1024) + " kB";
+}
+
+function renderTrack(track) {
+  const info = track || {};
+  $("artist").textContent = info.artist || "—";
+  $("title").textContent = info.title || "";
+  $("album").textContent = [info.album, info.year].filter(Boolean).join(" · ");
+  const cover = $("cover");
+  if (info.artwork) {
+    cover.src = info.artwork;
+    cover.hidden = false;
+  } else {
+    cover.hidden = true;
+    cover.removeAttribute("src");
+  }
+}
+
+function renderMeter(status) {
+  $("fill").style.width = pct(status.level) + "%";
+  $("gateMark").style.left = pct(status.threshold) + "%";
+  $("level").textContent = db(status.level);
+  $("gates").textContent = db(status.threshold) + " / " + db(status.floor);
+  $("playing").textContent = status.playing ? "yes — filling a clip" : "no";
+  $("playing").style.color = status.playing ? "#9ccc65" : "";
+  $("failures").textContent = String(status.failures || 0);
+  $("lookup").textContent = ago(status.last_lookup_seconds);
+  $("answer").textContent = status.last_answer || "—";
+  const bars = (status.levels || []).map((value) => {
+    const bar = document.createElement("span");
+    bar.style.height = Math.max(2, pct(value)) + "%";
+    bar.style.background = value >= status.threshold ? "#7cb342" : "#37507a";
+    bar.title = db(value);
+    return bar;
+  });
+  $("spark").replaceChildren(...bars);
+}
+function renderRip(status) {
+  const rip = status.rip || {};
+  const recording = rip.state === "recording";
+  const pill = $("ripState");
+  pill.textContent = rip.state || "idle";
+  pill.className = "pill" + (recording ? " on" : "");
+  $("ripElapsed").textContent = rip.seconds ? clock(rip.seconds) : "—";
+  $("ripPeak").textContent = (rip.peak_dbfs || -120) > -120
+    ? db(rip.peak_dbfs) + (rip.clipped ? " — clipping" : "")
+    : "—";
+  $("ripFile").textContent = rip.file ? rip.file.split("/").pop() : "—";
+  const button = $("ripButton");
+  button.textContent = recording ? "Stop the rip" : "Start a rip";
+  button.className = recording ? "stop" : "";
+  button.disabled = ripBusy;
+
+  const rows = (status.rips || []).map((file) => {
+    const row = document.createElement("tr");
+    const name = document.createElement("td");
+    const link = document.createElement("a");
+    link.href = "files/" + encodeURIComponent(file.name);
+    link.textContent = file.name;
+    name.append(link);
+    const bytes = document.createElement("td");
+    bytes.textContent = size(file.size);
+    const actions = document.createElement("td");
+    actions.className = "actions";
+    const download = document.createElement("a");
+    download.href = "files/" + encodeURIComponent(file.name) + "?download=1";
+    download.textContent = "download";
+    const remove = document.createElement("button");
+    remove.className = "del";
+    remove.textContent = "delete";
+    remove.onclick = () => deleteRip(file.name);
+    actions.append(download, " ", remove);
+    row.append(name, bytes, actions);
+    return row;
+  });
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 3;
+    cell.className = "muted";
+    cell.textContent = "no rips in " + (status.rip_dir || "the rip folder");
+    row.append(cell);
+    rows.push(row);
+  }
+  $("files").replaceChildren(...rows);
+}
+
+function renderEvents(events) {
+  const rows = (events || []).slice().reverse().map((event) => {
+    const item = document.createElement("li");
+    const stamp = document.createElement("time");
+    stamp.textContent = event[0];
+    item.append(stamp, document.createTextNode(event[1]));
+    return item;
+  });
+  if (!rows.length) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = "nothing yet";
+    rows.push(item);
+  }
+  $("events").replaceChildren(...rows);
+}
+
+function render(status) {
+  $("meta").textContent = [
+    "v" + status.version,
+    status.device,
+    (status.source || "").replace(/^alsa_(input|output)\\./, ""),
+    status.sample_rate + " Hz",
+    status.channels + (status.channels === 1 ? " channel" : " channels"),
+  ].join(" · ");
+  renderTrack(status.track);
+  renderMeter(status);
+  renderRip(status);
+  renderEvents(status.events);
+}
+
+async function refresh() {
+  try {
+    const response = await fetch("api/status", { cache: "no-store" });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    render(await response.json());
+  } catch (err) {
+    $("meta").textContent = "the add-on is not answering (" + err.message + ")";
+  }
+}
+
+async function ripAction(action) {
+  ripBusy = true;
+  $("ripButton").disabled = true;
+  try {
+    const response = await fetch("api/rip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: action }),
+    });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+  } catch (err) {
+    $("meta").textContent = "the rip command failed (" + err.message + ")";
+  }
+  ripBusy = false;
+  refresh();
+}
+
+async function deleteRip(name) {
+  if (!confirm("Delete " + name + "?")) return;
+  try {
+    const response = await fetch("files/" + encodeURIComponent(name), { method: "DELETE" });
+    if (!response.ok) throw new Error("HTTP " + response.status);
+  } catch (err) {
+    $("meta").textContent = "the delete failed (" + err.message + ")";
+  }
+  refresh();
+}
+
+$("ripButton").onclick = () => {
+  ripAction($("ripState").textContent === "recording" ? "stop" : "start");
+};
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
+"""
+)
+
+
+def rip_files(cfg: Config) -> list[dict[str, Any]]:
+    """Finished rips in `rip_dir`, newest first."""
+    directory = Path(cfg.rip_dir).expanduser()
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return []
+    files: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.suffix.lower() not in {".flac", ".wav"}:
+            continue
+        try:
+            info = entry.stat()
+        except OSError:
+            continue
+        files.append(
+            {"name": entry.name, "size": info.st_size, "modified": int(info.st_mtime)}
+        )
+    files.sort(key=lambda item: item["modified"], reverse=True)
+    return files[:50]
+
+
+def rip_path(cfg: Config, name: str) -> Path | None:
+    """`name` resolved inside `rip_dir`, or None when it is not a finished rip there."""
+    directory = Path(cfg.rip_dir).expanduser()
+    try:
+        resolved = (directory / name).resolve()
+        if resolved.parent != directory.resolve():
+            return None
+    except OSError:
+        return None
+    if resolved.suffix.lower() not in {".flac", ".wav"} or not resolved.is_file():
+        return None
+    return resolved
+
+
+async def web_server(
+    cfg: Config, status: dict[str, Any], commands: "asyncio.Queue[str]"
+) -> None:
+    """The UI behind Home Assistant ingress: what the listener hears, and the ripper."""
+
+    async def index(_request: web.Request) -> web.StreamResponse:
+        return web.Response(
+            text=INDEX_HTML,
+            content_type="text/html",
+            charset="utf-8",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    def recording_name() -> str:
+        """The file the ripper is writing right now, or "" when nothing is being written."""
+        rip = status.get("rip") or {}
+        if rip.get("state") != "recording":
+            return ""
+        current = rip.get("file") or ""
+        return Path(current).name if current else ""
+
+    async def api_status(_request: web.Request) -> web.StreamResponse:
+        payload: dict[str, Any] = dict(status)
+        rips = await asyncio.to_thread(rip_files, cfg)
+        mid_rip = recording_name()
+        payload["rips"] = [item for item in rips if item["name"] != mid_rip]
+        payload["rip_dir"] = cfg.rip_dir
+        payload["now"] = time.time()
+        looked_up = status.get("last_lookup")
+        payload["last_lookup_seconds"] = (
+            round(time.time() - looked_up) if looked_up else None
+        )
+        return web.json_response(payload)
+
+    async def api_rip(request: web.Request) -> web.StreamResponse:
+        try:
+            body = await request.json()
+        except (ValueError, aiohttp.ContentTypeError):
+            body = {}
+        action = str(body.get("action") or "").lower()
+        if action == "start":
+            await commands.put("ON")
+        elif action == "stop":
+            await commands.put("OFF")
+        else:
+            return web.json_response({"error": "action must be start or stop"}, status=400)
+        return web.json_response({"ok": True, "action": action})
+
+    async def api_file(request: web.Request) -> web.StreamResponse:
+        if request.match_info["name"] == recording_name():
+            raise web.HTTPConflict(text="that recording is still being written")
+        path = rip_path(cfg, request.match_info["name"])
+        if path is None:
+            raise web.HTTPNotFound()
+        disposition = "attachment" if request.query.get("download") == "1" else "inline"
+        return web.FileResponse(
+            path,
+            headers={"Content-Disposition": f'{disposition}; filename="{path.name}"'},
+        )
+
+    async def api_delete(request: web.Request) -> web.StreamResponse:
+        if request.match_info["name"] == recording_name():
+            raise web.HTTPConflict(text="that recording is still being written")
+        path = rip_path(cfg, request.match_info["name"])
+        if path is None:
+            raise web.HTTPNotFound()
+        try:
+            path.unlink()
+        except OSError as err:
+            return web.json_response({"error": str(err)}, status=500)
+        note(status, "Deleted %s" % path.name)
+        log.info("Deleted rip %s", path)
+        return web.json_response({"ok": True})
+
+    app = web.Application()
+    app.add_routes(
+        [
+            web.get("/", index),
+            web.get("/api/status", api_status),
+            web.post("/api/rip", api_rip),
+            web.get("/files/{name}", api_file),
+            web.delete("/files/{name}", api_delete),
+        ]
+    )
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+    try:
+        try:
+            await site.start()
+        except OSError as err:
+            log.error("Cannot serve the web UI on port %d (%s)", WEB_PORT, err)
+            return
+        log.info("Web UI listening on port %d — open it from the add-on page", WEB_PORT)
+        while not stop.is_set():
+            await asyncio.sleep(30)
+    finally:
+        await runner.cleanup()
 
 
 def handle_signal(signum: int, _frame: Any) -> None:

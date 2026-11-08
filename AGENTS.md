@@ -8,14 +8,15 @@ publishing, ffmpeg for decoding and for the FLAC encode; no framework, no tests 
 
 Version lives in two places and both must be bumped together:
 `vinyl_ear/config.yaml` (`version:`) and `VERSION` in `vinyl_ear/app/main.py` (that is
-what the startup banner prints). Current: **0.7.0**.
+what the startup banner prints). Current: **0.7.1**.
 
 ```
 vinyl_ear/config.yaml      add-on manifest: audio: true, homeassistant_api: true,
                            map: config:rw + share:rw (rips), options + schema
 vinyl_ear/Dockerfile       python:3.11-slim + ffmpeg + pulseaudio-utils
 vinyl_ear/app/main.py      everything: capture, noise gate, Shazam, artwork cache,
-                           MQTT discovery, rip recorder, run loop
+                           MQTT discovery, rip recorder, run loop, the ingress web UI
+                           (aiohttp server + the page it serves, as one string)
 vinyl_ear/run.sh           sets PULSE_SERVER to /run/audio/pulse.sock when present
 lovelace/*.yaml            card/view YAML that is pasted or patched into Lovelace
 repository.yaml            makes this repo an add-on repository
@@ -200,6 +201,15 @@ patch the storage file from those, do not hand-edit the JSON.
    duplicated mono channel, and asking for mono on a stereo one throws half the signal
    away, so the count is discovered rather than assumed. With two capture devices plugged
    in, `source` must be set explicitly: "the first non-monitor source" is not stable.
+11. **A rip command was only served when audio arrived.** `rip_worker()` looked at
+    `commands` and then sat in `await tape.get()`, so pressing Stop — MQTT switch or web UI —
+    while the capture stream was silent *or gone* did nothing until the next chunk arrived.
+    With `parec` alive that is 0.1 s and invisible; with it dead the rip could not be stopped
+    at all (not even by `rip_max_minutes`, whose check was also behind the read). The worker
+    now uses `tape.get_nowait()` and sleeps `RIP_POLL_SECONDS` (0.5 s) when the tape is empty,
+    which serves commands and the time limit whatever the audio is doing. Found by feeding
+    `rip_worker()` a hand-made tape: the fake reader stopped, and `OFF` sat in the queue
+    while the state stayed `recording`.
 
 ## Ripping
 
@@ -210,6 +220,32 @@ lives on `vinyl_ear/<device>/rip` (progress JSON) and `.../rip/state` (`ON`/`OFF
 and the switch entity drives `.../rip/set`. `rip_max_minutes` bounds a forgotten switch.
 Files land in `rip_dir`, `/share/vinyl-rips` by default, which is why the manifest now maps
 `share:rw`.
+
+## Web interface
+
+`web_server()` is the third task beside `audio_reader()` and `rip_worker()` inside `run()`,
+bound to `0.0.0.0:8099` — that number must equal `ingress_port` in `config.yaml`, because
+ingress proxies to it inside the container and the port is never published. `ingress: true`
+is what puts **Open Web UI** on the add-on page and in the sidebar; `webui:` was deliberately
+*not* used, since without a `ports:` mapping that button points at a port nothing listens on.
+
+There is no second state store. `run()` keeps one `status` dict and mutates it while it
+listens — level, the last `WEB_LEVELS` (120) chunk levels, `playing`, refusals, threshold and
+measured floor, last lookup time and answer, the published track, the rip snapshot and a
+40-line event log through `note()` — and `rip_worker()` writes the very object `report()`
+publishes to `.../rip` into `status["rip"]`, so the page agrees with Home Assistant by
+construction. The page polls `/api/status` once a second. `POST /api/rip` with
+`{"action":"start"|"stop"}` puts `ON`/`OFF` on **the same `commands` queue the MQTT switch
+uses**, so there is one worker and one code path. Recordings are served by *name* only
+(`GET /files/<name>`, `?download=1`, `DELETE`), resolved inside `rip_dir` with a parent
+check: there is no path parameter to traverse, and this is the add-on's only write/delete
+surface.
+
+Everything the page asks for is **relative** (`fetch("api/status")`, `href="files/…"`), which
+is what makes it work under the ingress prefix `/api/hassio_ingress/<token>/` without knowing
+the prefix. Absolute `/api/...` URLs would hit Home Assistant itself and 404. Artwork is the
+exception and stays as published: `/local/vinyl-art/...` is root-relative on the same origin,
+which is correct because the ingress page is served from Home Assistant's origin.
 
 ## Testing without a turntable
 
@@ -256,6 +292,24 @@ For MQTT, read retained payloads from inside the `homeassistant` container (it s
 long-lived token, so Home Assistant's own state and API cannot be queried directly; use
 the storage files under `/config/.storage` instead.
 
+The web UI is worth testing too, because it is the add-on's only write surface, and
+`aiohttp` is already in the image. Load `main.py` by path, start
+`asyncio.create_task(web_server(cfg, status, commands))` with a hand-made `status` dict and a
+`rip_dir` full of fake files, and drive it with a `ClientSession`: `GET /` (200, and the page
+has `id="ripButton"`), `GET /api/status` (the rip list skips non-`.flac`/`.wav` names and
+directories), `POST /api/rip` with `{"action":"start"}` (leaves `"ON"` on the queue, so the
+MQTT switch and the button provably share one path) and with `{"action":"rewind"}` (400,
+queue untouched), `GET /files/<name>` (inline) and `?download=1` (attachment),
+`GET /files/notes.txt` and `GET /files/%2e%2e%2fmain.py` (both 404), then `DELETE` and check
+the file is gone and the listing shrank. Move `WEB_PORT` off 8099 in the harness so it cannot
+collide with a real Home Assistant on the developer's machine. Driving `rip_worker()` with a
+fake tape and a fake client checks the other half: `status["rip"]` goes `recording` → `idle`,
+names the `.wav` while recording and the `.flac` after, and — gotcha 11 — the tape must be
+allowed to go *dry* before `OFF` is queued. The whole `run()` can be driven the same way with
+`audio_reader`, `recognise`, `cache_artwork`, `publish_discovery`, `find_source` and
+`source_channels` monkeypatched and `Shazam` stubbed with a bare class; that is what proves the
+page reads the live `status` rather than a snapshot.
+
 ## Release checklist
 
 1. Bump `VERSION` in `vinyl_ear/app/main.py` and `version:` in `vinyl_ear/config.yaml`.
@@ -293,6 +347,10 @@ the storage files under `/config/.storage` instead.
 
 ## Known limitations
 
+- The web UI only exists through ingress. It has no authentication of its own, so there is
+  no `ports:` mapping and no `webui:` — a published 8099 would let anyone on the LAN start,
+  stop and delete rips. If it ever has to be exposed, put it behind HA's auth proxy rather
+  than adding a password to the page.
 - Shazam here is reverse engineered (`shazamio`): no key, no quota, but it can break.
   ACRCloud or AudD would slot in behind the same interface.
 - Obscure and private pressings are simply unknown to Shazam. Rather than holding the last
